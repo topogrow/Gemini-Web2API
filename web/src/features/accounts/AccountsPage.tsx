@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Globe, Power, PowerOff, ShieldCheck, Users } from 'lucide-react'
+import { ExternalLink, Globe, Power, PowerOff, ShieldCheck, Users } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
 
@@ -114,6 +114,22 @@ export function AccountsPage() {
   const start = (action: BatchAction) => {
     batch.mutate({ action, accounts: selected })
   }
+  const launchBrowser = useMutation({
+    mutationFn: (account: Account) =>
+      api('/api/accounts/' + encodeURIComponent(account.account_id) + '/launch-browser', {
+        method: 'POST',
+      }),
+    onSuccess: (_, account) => {
+      void client.invalidateQueries({ queryKey: accountsKey })
+      toast({
+        tone: 'success',
+        title: `账号 [${account.account_id}] 独立沙盒登录成功，凭据已更新！`,
+      })
+    },
+    onError: (error) => {
+      toast({ tone: 'error', title: '启动独立环境失败: ' + error.message })
+    },
+  })
   return (
     <>
       <PageHeader
@@ -233,6 +249,7 @@ export function AccountsPage() {
                 </Th>
                 <Th>{m.account}</Th>
                 <Th>{m.state}</Th>
+                <Th>独立沙盒</Th>
                 <Th>{m.source}</Th>
                 <Th>{m.tier}</Th>
                 <Th className="text-right">{m.models}</Th>
@@ -270,6 +287,29 @@ export function AccountsPage() {
                   </Td>
                   <Td>
                     <Badge tone={stateTone(account.state)}>{sm[account.state]}</Badge>
+                  </Td>
+                  <Td className="whitespace-nowrap">
+                    <div className="flex items-center gap-1.5">
+                      {account.has_profile ? (
+                        <Badge tone="success">已就绪</Badge>
+                      ) : (
+                        <Badge tone="warning">未绑定</Badge>
+                      )}
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="size-7"
+                        title={account.has_profile ? '打开专属独立窗口重登' : '创建专属沙盒并登录'}
+                        loading={launchBrowser.isPending && launchBrowser.variables?.account_id === account.account_id}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          toast({ tone: 'neutral', title: '正在拉起独立 Chrome 窗口...' })
+                          launchBrowser.mutate(account)
+                        }}
+                      >
+                        <ExternalLink size={14} aria-hidden />
+                      </Button>
+                    </div>
                   </Td>
                   <Td>{account.source === 'chrome' ? m.sourceChrome : m.sourceCookie}</Td>
                   <Td>{account.tier ?? m.none}</Td>

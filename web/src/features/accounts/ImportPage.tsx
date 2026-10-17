@@ -17,6 +17,82 @@ import { api } from '@/lib/api'
 import { formatDateTime } from '@/lib/format'
 import { fill, useI18n, useMessages } from '@/lib/i18n'
 
+// MacCdpLoginImport 是通过独立隔离沙盒一键登录导入
+function MacCdpLoginImport() {
+  const client = useQueryClient()
+  const [id, setId] = useState('')
+  const [proxy, setProxy] = useState('')
+  const run = useMutation({
+    mutationFn: () =>
+      api<{ account?: { account_id: string } }>('/api/accounts/import/login', {
+        method: 'POST',
+        json: { id: id.trim(), proxy: proxy.trim() },
+      }),
+    onSuccess: (data) => {
+      void client.invalidateQueries({ queryKey: accountsKey })
+      toast({
+        tone: 'success',
+        title: `✅ 账号 [${data.account?.account_id || id}] 独立沙盒登录成功，凭据已自动保活！`,
+      })
+      setId('')
+    },
+    onError: (error) => {
+      toast({ tone: 'error', title: '启动沙盒登录失败: ' + error.message })
+    },
+  })
+
+  return (
+    <Section
+      title="macOS 独立环境一键创建（推荐，永久自动保活）"
+      description="自动为该账号在本地创建物理隔离的专属 Chrome 沙盒目录，并弹出独立浏览器窗口供你登录。登录完成后自动捕获凭据，后续由后台无头 Chrome 自动静默续签，彻底解决 Cookie 失效问题。"
+    >
+      <Field
+        id="cdp-id"
+        label="账号标识 / Gmail"
+        description="输入账号名称（例如 c4993764-gmail-com 或你的邮箱地址）"
+      >
+        <Input
+          id="cdp-id"
+          value={id}
+          placeholder="user@gmail.com"
+          onChange={(event) => {
+            setId(event.target.value)
+          }}
+        />
+      </Field>
+      <Field
+        id="cdp-proxy"
+        label="专属代理 (可选)"
+        description="留空则使用全局默认代理（如 http://127.0.0.1:7897）"
+      >
+        <Input
+          id="cdp-proxy"
+          value={proxy}
+          placeholder="http://127.0.0.1:7897"
+          onChange={(event) => {
+            setProxy(event.target.value)
+          }}
+        />
+      </Field>
+      <div>
+        <Button
+          disabled={!id.trim()}
+          loading={run.isPending}
+          onClick={() => {
+            toast({
+              tone: 'neutral',
+              title: '正在拉起专属独立 Chrome 窗口，请在弹出的浏览器中登录 Google 账号...',
+            })
+            run.mutate()
+          }}
+        >
+          创建沙盒并在独立窗口中登录
+        </Button>
+      </div>
+    </Section>
+  )
+}
+
 // ChromeImport 是从本机 Chrome Profile 导入
 function ChromeImport() {
   const m = useMessages(importMessages)
@@ -271,6 +347,7 @@ export function ImportPage() {
     <>
       <PageHeader title={m.title} description={m.description} />
       <div className="flex w-full flex-col gap-3">
+        <MacCdpLoginImport />
         <ChromeImport />
         <CookieImport />
         <RemotePairing />

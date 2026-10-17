@@ -36,6 +36,8 @@ export interface Account {
   enabled: boolean
   source: AccountSource
   profile?: string
+  has_profile?: boolean
+  profile_path?: string
   proxy?: string
   proxy_source?: 'fixed' | 'direct' | 'pool' | 'system'
   tier?: string

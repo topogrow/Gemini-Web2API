@@ -26,6 +26,7 @@ import {
 import { fixedProxy } from '@/features/accounts/proxy'
 import { ProxyDialog } from '@/features/accounts/ProxyDialog'
 import { ProxyValue } from '@/features/accounts/ProxyValue'
+import { AccountProfilePanel } from '@/features/accounts/AccountProfilePanel'
 import { accountsKey, useAccounts } from '@/features/accounts/queries'
 import type { Account, AccountsUsage, UsageWindow } from '@/features/accounts/types'
 import { stateTone, windowTone } from '@/features/accounts/usage'
@@ -250,6 +251,8 @@ export function AccountPage() {
           })}
         </p>
       )}
+
+      <AccountProfilePanel account={account} />
 
       <Card>
         <CardHeader
