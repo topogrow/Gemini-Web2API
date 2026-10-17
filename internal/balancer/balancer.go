@@ -73,6 +73,8 @@ type AccountStatus struct {
 	Enabled          bool              `json:"enabled"`
 	Source           string            `json:"source,omitempty"`
 	Profile          string            `json:"profile,omitempty"`
+	HasProfile       bool              `json:"has_profile"`
+	ProfilePath      string            `json:"profile_path,omitempty"`
 	Proxy            string            `json:"proxy,omitempty"`
 	ProxySource      string            `json:"proxy_source,omitempty"`
 	Tier             string            `json:"tier,omitempty"`

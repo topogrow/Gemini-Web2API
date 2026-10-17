@@ -12,10 +12,22 @@ import (
 func (h *handler) account(id string) (balancer.AccountStatus, bool) {
 	for _, account := range h.Pool.Status().Accounts {
 		if account.AccountID == id {
+			account.HasProfile, account.ProfilePath = CheckAccountProfile(account.AccountID)
 			return account, true
 		}
 	}
 	return balancer.AccountStatus{}, false
+}
+
+// accounts 返回带 Profile 状态的完整账号列表
+func (h *handler) accounts() []balancer.AccountStatus {
+	raw := h.Pool.Status().Accounts
+	result := make([]balancer.AccountStatus, len(raw))
+	for i, acc := range raw {
+		acc.HasProfile, acc.ProfilePath = CheckAccountProfile(acc.AccountID)
+		result[i] = acc
+	}
+	return result
 }
 
 // respondAccount 返回账号最新状态，操作失败时返回 400 与原因
@@ -138,8 +150,24 @@ func (h *handler) importCookie(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "account_import_failed", err.Error())
 		return
 	}
-	h.respondAccount(c, id, nil)
-}
+		h.respondAccount(c, id, nil)
+	}
+
+	func (h *handler) importLogin(c *gin.Context) {
+		var input struct {
+			ID    string `json:"id"`
+			Proxy string `json:"proxy"`
+		}
+		if !bindJSON(c, &input) {
+			return
+		}
+		id, err := h.Accounts.LoginAndImport(c.Request.Context(), trimmed(input.ID), trimmed(input.Proxy))
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "account_import_failed", err.Error())
+			return
+		}
+		h.respondAccount(c, id, nil)
+	}
 
 func (h *handler) accountsByID(ids []string) []balancer.AccountStatus {
 	wanted := make(map[string]bool, len(ids))
@@ -149,8 +177,57 @@ func (h *handler) accountsByID(ids []string) []balancer.AccountStatus {
 	result := []balancer.AccountStatus{}
 	for _, account := range h.Pool.Status().Accounts {
 		if wanted[account.AccountID] {
+			account.HasProfile, account.ProfilePath = CheckAccountProfile(account.AccountID)
 			result = append(result, account)
 		}
 	}
 	return result
 }
+
+// launchAccountBrowser 以该账号的独立 Profile 启动可视化 Chrome 窗口进行重登或进入
+func (h *handler) launchAccountBrowser(c *gin.Context) {
+	id := c.Param("id")
+	account, ok := h.account(id)
+	if !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	importedID, err := h.Accounts.LoginAndImport(c.Request.Context(), account.AccountID, account.Proxy)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "launch_browser_failed", err.Error())
+		return
+	}
+	h.respondAccount(c, importedID, nil)
+}
+
+// headlessRefreshAccount 以该账号的独立 Profile 触发一次无头静默续签测试
+func (h *handler) headlessRefreshAccount(c *gin.Context) {
+	id := c.Param("id")
+	account, ok := h.account(id)
+	if !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	cookies, err := chromeauth.RefreshDarwin(c.Request.Context(), account.AccountID, account.Proxy)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "refresh_failed", err.Error())
+		return
+	}
+	_ = h.Accounts.Verify(id)
+	c.JSON(http.StatusOK, gin.H{"success": true, "cookies_count": len(cookies)})
+}
+
+// resetAccountProfile 清空并重置该账号在本地的独立 Chrome Profile 沙盒
+func (h *handler) resetAccountProfile(c *gin.Context) {
+	id := c.Param("id")
+	if _, ok := h.account(id); !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	if err := ResetAccountProfile(id); err != nil {
+		writeError(c, http.StatusInternalServerError, "reset_profile_failed", err.Error())
+		return
+	}
+	h.respondAccount(c, id, nil)
+}
+
