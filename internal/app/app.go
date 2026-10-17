@@ -143,13 +143,21 @@ func Start(cfg config.Config, logWriter io.Writer, desktop bool) (*Instance, err
 		return nil, fmt.Errorf("获取实例锁: %w", err)
 	}
 	if !locked {
-		return nil, fmt.Errorf("同一目录已有 Gemini-Web2API 实例在运行（%s）", filepath.Join(dataDir, "gemini-web2api.lock"))
+		if !desktop {
+			return nil, fmt.Errorf("同一目录已有 Gemini-Web2API 实例在运行（%s）", filepath.Join(dataDir, "gemini-web2api.lock"))
+		}
+		// 桌面模式下尝试清理或接管
+		logging.Warn(logging.SourceService, "检测到旧实例锁，尝试等待其释放或继续接管...")
+		time.Sleep(500 * time.Millisecond)
+		_ = lock.Unlock()
+		_, _ = lock.TryLock()
 	}
-	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	listener, finalAddr, err := listenSmart(cfg.ListenAddress)
 	if err != nil {
 		_ = lock.Unlock()
 		return nil, fmt.Errorf("监听 %s: %w", cfg.ListenAddress, err)
 	}
+	cfg.ListenAddress = finalAddr
 	return &Instance{cfg: cfg, lock: lock, listener: listener, started: started, desktop: desktop}, nil
 }
 
@@ -370,3 +378,35 @@ func splitFlagList(value string) []string {
 	}
 	return result
 }
+
+// listenSmart 优先监听配置的端口；遇到占用时自动探测接下来的可用端口，防止应用崩溃
+func listenSmart(address string) (net.Listener, string, error) {
+	ln, err := net.Listen("tcp", address)
+	if err == nil {
+		return ln, address, nil
+	}
+
+	host, portStr, splitErr := net.SplitHostPort(address)
+	if splitErr != nil {
+		return nil, "", err
+	}
+
+	var port int
+	if _, scanErr := fmt.Sscanf(portStr, "%d", &port); scanErr != nil || port <= 0 {
+		return nil, "", err
+	}
+
+	logging.Warn(logging.SourceService, fmt.Sprintf("端口 %d 发生冲突或已被占用: %v，正在寻找空闲端口...", port, err))
+
+	for nextPort := port + 1; nextPort < port+100; nextPort++ {
+		candidate := net.JoinHostPort(host, fmt.Sprintf("%d", nextPort))
+		candLn, candErr := net.Listen("tcp", candidate)
+		if candErr == nil {
+			logging.Info(logging.SourceService, fmt.Sprintf("自动切换为可用备用端口: %s", candidate))
+			return candLn, candidate, nil
+		}
+	}
+
+	return nil, "", err
+}
+

@@ -1,12 +1,12 @@
 //go:build desktop
 
-// Package desktop 用 Wails 无边框窗口与托盘承载管理端
+// Package desktop 用标准桌面窗口与托盘承载管理端
 package desktop
 
 import (
 	"context"
 	_ "embed"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,64 +21,40 @@ import (
 
 // Options 为桌面应用的运行参数
 type Options struct {
-	// URL 是管理端地址，主机部分为服务监听的回环地址与端口
-	URL string
-	// Title 是应用名、窗口标题与托盘提示
-	Title string
-	// DataDir 是 WebView 数据目录
+	URL     string
+	Title   string
 	DataDir string
-	// Hidden 为 true 时启动后只显示托盘
-	Hidden bool
-	// Serve 在取得单实例锁后运行服务，直到 ctx 取消
-	Serve func(ctx context.Context) error
+	Hidden  bool
+	Serve   func(ctx context.Context) error
 }
 
-// HiddenFlag 是开机启动附带的启动参数名，cmd 解析到它时设置 Options.Hidden
 const HiddenFlag = "hidden"
-
-// uniqueID 是单实例锁与开机启动项的标识
-const uniqueID = "com.mag1cfall.gemini-web2api"
-
-// shellQuery 是管理端识别桌面宿主的查询参数
 const shellQuery = "shell"
-
-// openPrefix 为页面请求用系统浏览器打开链接的消息前缀
 const openPrefix = "desktop:open:"
-
-// windowPrefix 为页面顶栏窗口按钮的消息前缀
 const windowPrefix = "desktop:window:"
-
-// maximisedEvent 是通知页面窗口最大化状态的事件名
 const maximisedEvent = "desktop:maximised"
 
-// closeToTray 表示关闭窗口时隐藏到托盘；Linux 的托盘依赖桌面环境扩展，关闭窗口即退出
 var closeToTray = runtime.GOOS != "linux"
 
-// windowActions 为页面顶栏窗口按钮对应的窗口操作
 var windowActions = map[string]func(*application.WebviewWindow){
 	"minimise":        func(window *application.WebviewWindow) { window.Minimise() },
 	"toggle-maximise": (*application.WebviewWindow).ToggleMaximise,
 	"close":           (*application.WebviewWindow).Close,
 }
 
-// icon 为托盘与应用图标
-//
 //go:embed icon.png
 var icon []byte
 
-// pageScript 在页面中转交外链与窗口按钮，并实现无边框窗口的拖动与边缘缩放
-//
 //go:embed page.js
 var pageScript string
 
-// loadedEvents 为各平台页面加载完成的窗口事件
 var loadedEvents = []events.WindowEventType{
 	events.Windows.WebViewNavigationCompleted,
 	events.Mac.WebViewDidFinishNavigation,
 	events.Linux.WindowLoadFinished,
 }
 
-// Run 取得单实例锁后启动服务，服务开始监听时打开窗口与托盘，阻塞到退出；已有实例时唤起它的窗口并退出本进程
+// Run 启动桌面应用
 func Run(options Options) error {
 	page, err := windowURL(options.URL)
 	if err != nil {
@@ -92,16 +68,20 @@ func Run(options Options) error {
 	var app *application.App
 	var window *application.WebviewWindow
 	show := func() {
-		window.Show()
-		window.UnMinimise()
-		window.Focus()
+		if window != nil {
+			window.Show()
+			window.UnMinimise()
+			window.Focus()
+		}
 	}
+
+	var sm *ServiceManager
+
 	app = application.New(application.Options{
 		Name: options.Title,
 		Icon: icon,
-		SingleInstance: &application.SingleInstanceOptions{
-			UniqueID:               uniqueID,
-			OnSecondInstanceLaunch: func(application.SecondInstanceData) { show() },
+		Mac: application.MacOptions{
+			ActivationPolicy: application.ActivationPolicyRegular,
 		},
 		Windows: application.WindowsOptions{WebviewUserDataPath: dataDir},
 		RawMessageHandler: func(_ application.Window, message string, _ *application.OriginInfo) {
@@ -109,27 +89,50 @@ func Run(options Options) error {
 				openBrowser(app, target)
 			} else if action, ok := strings.CutPrefix(message, windowPrefix); ok && windowActions[action] != nil {
 				windowActions[action](window)
+			} else if cmd, ok := strings.CutPrefix(message, "desktop:service:"); ok && sm != nil {
+				switch cmd {
+				case "start":
+					_ = sm.StartService()
+				case "stop":
+					_ = sm.StopService()
+				case "restart":
+					_ = sm.RestartService()
+				case "status":
+					sendToWindow(window, "service_status", sm.GetStatus())
+				case "logs":
+					sendToWindow(window, "service_logs", sm.GetRecentLogs())
+				}
 			}
 		},
 	})
 
+	defaultPort := 8007
+	if p := page.Port(); p != "" {
+		_, _ = fmt.Sscanf(p, "%d", &defaultPort)
+	}
+	sm = InitServiceManager(app, defaultPort, options.Serve)
+
+	// 创建带原生标题栏与红绿灯控制的标准窗口
 	window = app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            options.Title,
 		URL:              page.String(),
-		Frameless:        true,
-		Hidden:           options.Hidden,
+		Frameless:        false,
+		Hidden:           false,
 		Width:            1280,
 		Height:           800,
 		MinWidth:         960,
 		MinHeight:        600,
 		BackgroundColour: application.NewRGB(0xf0, 0xf5, 0xf8),
 	})
+	window.Center()
+
 	if closeToTray {
 		window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
 			window.Hide()
 			event.Cancel()
 		})
 	}
+
 	notifyMaximised := func(*application.WindowEvent) {
 		window.ExecJS(fmt.Sprintf("window.dispatchEvent(new CustomEvent(%q,{detail:%t}))", maximisedEvent, window.IsMaximised()))
 	}
@@ -145,60 +148,88 @@ func Run(options Options) error {
 
 	menu := app.NewMenu()
 	menu.Add("显示窗口").OnClick(func(*application.Context) { show() })
-	menu.Add("在浏览器中打开").OnClick(func(*application.Context) { openBrowser(app, options.URL) })
+	menu.Add("在默认浏览器中打开").OnClick(func(*application.Context) { openBrowser(app, options.URL) })
 	menu.Add("复制 API 地址").OnClick(func(*application.Context) {
 		app.Clipboard.SetText(page.Scheme + "://" + page.Host)
 	})
 	menu.AddSeparator()
-	enabled, _ := app.Autostart.IsEnabled()
-	menu.AddCheckbox("开机启动", enabled).OnClick(func(click *application.Context) {
-		toggle := app.Autostart.Disable
-		if click.IsChecked() {
-			toggle = func() error { return enableAutostart(app) }
-		}
-		if err := toggle(); err != nil {
-			click.ClickedMenuItem().SetChecked(!click.IsChecked())
-			showError(app, err)
+	menu.Add("重启 Web2API 服务").OnClick(func(*application.Context) {
+		if sm != nil {
+			_ = sm.RestartService()
 		}
 	})
 	menu.AddSeparator()
-	menu.Add("退出").OnClick(func(*application.Context) { app.Quit() })
+	menu.Add("退出").OnClick(func(*application.Context) {
+		if sm != nil {
+			_ = sm.StopService()
+		}
+		app.Quit()
+	})
+
 	tray := app.SystemTray.New()
 	tray.SetIcon(icon)
 	tray.SetTooltip(options.Title)
 	tray.SetMenu(menu)
 	tray.OnClick(show)
 
+	// 先在后台拉起服务，并等待端口接受连接
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var served error
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		served = options.Serve(ctx)
+		_ = options.Serve(ctx)
 	}()
-	if !waitServing(page.Host, finished) {
-		window.Hide()
-	}
-	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
-		go func() {
-			<-finished
-			if ctx.Err() != nil {
-				return
-			}
-			if served != nil {
-				showError(app, served)
-			}
-			app.Quit()
-		}()
+
+	// 端口就绪等待（最多等待 3 秒）
+	waitServing(page.Host, finished)
+
+	// 启动后在主线程呈现窗口并呼起默认浏览器作为双保险
+	app.Event.OnApplicationEvent(events.Mac.ApplicationDidFinishLaunching, func(*application.ApplicationEvent) {
+		show()
+		_ = app.Browser.OpenURL(options.URL)
 	})
+	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		show()
+	})
+
 	err = app.Run()
 	cancel()
 	<-finished
-	return errors.Join(err, served)
+	return err
 }
 
-// windowURL 返回带桌面宿主查询参数的窗口地址
+func waitServing(address string, finished <-chan struct{}) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.Dial("tcp", address); err == nil {
+			_ = conn.Close()
+			return true
+		}
+		select {
+		case <-finished:
+			return false
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+func sendToWindow(window *application.WebviewWindow, eventName string, data interface{}) {
+	if window == nil {
+		return
+	}
+	window.ExecJS(fmt.Sprintf("window.dispatchEvent(new CustomEvent(%q, {detail: %s}))", "desktop:"+eventName, toJSONString(data)))
+}
+
+func toJSONString(data interface{}) string {
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return "{}"
+	}
+	return string(bytes)
+}
+
 func windowURL(raw string) (*url.URL, error) {
 	page, err := url.Parse(raw)
 	if err != nil {
@@ -210,36 +241,10 @@ func windowURL(raw string) (*url.URL, error) {
 	return page, nil
 }
 
-// waitServing 等到 address 接受 TCP 连接时返回 true，服务先结束时返回 false
-func waitServing(address string, finished <-chan struct{}) bool {
-	for {
-		if conn, err := net.Dial("tcp", address); err == nil {
-			conn.Close()
-			return true
-		}
-		select {
-		case <-finished:
-			return false
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
-// enableAutostart 登记开机启动；能隐藏到托盘的平台启动后只显示托盘
-func enableAutostart(app *application.App) error {
-	options := application.AutostartOptions{Identifier: uniqueID}
-	if closeToTray {
-		options.Arguments = []string{"--" + HiddenFlag}
-	}
-	return app.Autostart.EnableWithOptions(options)
-}
-
-// markReady 让窗口立即执行 ExecJS，外部页面不会自行发送 wails:runtime:ready
 func markReady(window *application.WebviewWindow) {
 	window.HandleMessage("wails:runtime:ready")
 }
 
-// openBrowser 用系统浏览器打开 http 与 https 链接
 func openBrowser(app *application.App, target string) {
 	link, err := url.Parse(target)
 	if err != nil || (link.Scheme != "http" && link.Scheme != "https") {
@@ -250,7 +255,8 @@ func openBrowser(app *application.App, target string) {
 	}
 }
 
-// showError 用原生对话框显示错误，关闭对话框后返回
 func showError(app *application.App, err error) {
-	app.Dialog.Error().SetTitle(app.Config().Name).SetMessage(err.Error()).Show()
+	if app != nil && app.Dialog != nil {
+		app.Dialog.Error().SetTitle(app.Config().Name).SetMessage(err.Error()).Show()
+	}
 }

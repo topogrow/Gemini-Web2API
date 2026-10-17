@@ -5,10 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	_ "time/tzdata"
 
 	"github.com/Mag1cFall/Gemini-Web2API/internal/app"
 )
+
+func init() {
+	runtime.LockOSThread()
+}
 
 // main 执行单二进制命令入口
 func main() {

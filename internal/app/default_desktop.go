@@ -48,6 +48,7 @@ func desktopDataDir() (string, error) {
 
 // runDefault 以桌面窗口与托盘运行服务，日志写入数据目录并按大小轮转
 func runDefault(args []string) error {
+	runtime.LockOSThread()
 	hidden := slices.Contains(args, "--"+desktop.HiddenFlag)
 	args = slices.DeleteFunc(slices.Clone(args), func(arg string) bool { return arg == "--"+desktop.HiddenFlag })
 	cfg, _, err := LoadConfig(args)
