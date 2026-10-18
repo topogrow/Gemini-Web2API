@@ -262,13 +262,13 @@ func (h *handler) events(c *gin.Context) {
 	}
 	snapshots := map[string][]byte{}
 	push := func() bool {
-		for _, item := range []struct {
-			kind string
-			data any
-		}{
-			{"status", h.status()}, {"accounts", h.Pool.Status().Accounts}, {"models", h.models()},
-			{"cooldowns", h.cooldowns()}, {"requests", logging.ActiveRequests()}, {"recent", logging.RecentRequests()},
-		} {
+			for _, item := range []struct {
+				kind string
+				data any
+			}{
+				{"status", h.status()}, {"accounts", h.accounts()}, {"models", h.models()},
+				{"cooldowns", h.cooldowns()}, {"requests", logging.ActiveRequests()}, {"recent", logging.RecentRequests()},
+			} {
 			encoded, _ := json.Marshal(item.data)
 			if bytes.Equal(encoded, snapshots[item.kind]) {
 				continue
