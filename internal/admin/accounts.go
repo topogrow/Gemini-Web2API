@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"path/filepath"
 
 	"github.com/Mag1cFall/Gemini-Web2API/internal/balancer"
 	"github.com/Mag1cFall/Gemini-Web2API/internal/chromeauth"
@@ -230,4 +231,48 @@ func (h *handler) resetAccountProfile(c *gin.Context) {
 	}
 	h.respondAccount(c, id, nil)
 }
+
+// getStorageState 读取账号的 storage-state.json 原始文本
+func (h *handler) getStorageState(c *gin.Context) {
+	id := c.Param("id")
+	if _, ok := h.account(id); !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	path := filepath.Join(h.Accounts.Settings().AuthDir, id, "storage-state.json")
+	data, err := ReadStorageStateRaw(path)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "read_storage_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"content": string(data)})
+}
+
+// updateStorageState 校验并写回账号的 storage-state.json，并热重载该账号
+func (h *handler) updateStorageState(c *gin.Context) {
+	id := c.Param("id")
+	if _, ok := h.account(id); !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	var input struct {
+		Content string `json:"content"`
+	}
+	if !bindJSON(c, &input) {
+		return
+	}
+	rawBytes := []byte(input.Content)
+	path := filepath.Join(h.Accounts.Settings().AuthDir, id, "storage-state.json")
+	if err := WriteStorageStateRaw(path, rawBytes); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	importedID, err := h.Accounts.ImportState(rawBytes)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "reload_account_failed", err.Error())
+		return
+	}
+	h.respondAccount(c, importedID, nil)
+}
+
 

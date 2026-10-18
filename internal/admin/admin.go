@@ -60,6 +60,8 @@ func Mount(router *gin.Engine, deps Deps) {
 	api.POST("/accounts/:id/launch-browser", h.launchAccountBrowser)
 	api.POST("/accounts/:id/headless-refresh", h.headlessRefreshAccount)
 	api.POST("/accounts/:id/reset-profile", h.resetAccountProfile)
+	api.GET("/accounts/:id/storage-state", h.getStorageState)
+	api.PUT("/accounts/:id/storage-state", h.updateStorageState)
 	api.GET("/accounts/import/chrome", h.chromeProfiles)
 	api.POST("/accounts/import/chrome", h.importChrome)
 	api.POST("/accounts/import/cookie", h.importCookie)

@@ -1,11 +1,13 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, RefreshCw, Trash2 } from 'lucide-react'
+import { ExternalLink, FileCode, RefreshCw, Trash2 } from 'lucide-react'
+import { useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader, Section } from '@/components/ui/page'
 import { toast } from '@/components/ui/toast'
 import { accountsKey } from '@/features/accounts/queries'
+import { StorageStateDialog } from '@/features/accounts/StorageStateDialog'
 import type { Account } from '@/features/accounts/types'
 import { api } from '@/lib/api'
 
@@ -16,6 +18,7 @@ interface AccountProfilePanelProps {
 export function AccountProfilePanel({ account }: AccountProfilePanelProps) {
   const client = useQueryClient()
   const id = account.account_id
+  const [editJsonOpen, setEditJsonOpen] = useState(false)
 
   // 1. 唤起专属 Chrome 窗口进行登录/重登
   const launchBrowser = useMutation({
@@ -144,8 +147,23 @@ export function AccountProfilePanel({ account }: AccountProfilePanelProps) {
               </Button>
             </>
           )}
+
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setEditJsonOpen(true)
+            }}
+          >
+            <FileCode size={16} aria-hidden />
+            修改 Cookie JSON
+          </Button>
         </div>
       </div>
+
+      {editJsonOpen && (
+        <StorageStateDialog accountId={id} onClose={() => setEditJsonOpen(false)} />
+      )}
     </Card>
   )
 }

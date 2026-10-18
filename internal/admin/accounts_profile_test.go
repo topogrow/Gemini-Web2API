@@ -40,3 +40,59 @@ func TestAccountProfileHelpers(t *testing.T) {
 	// 清理临时文件
 	_ = os.RemoveAll(filepath.Dir(dir))
 }
+
+func TestAccountStorageState(t *testing.T) {
+	testAccID := "test-storage-acc"
+	tempDir, err := os.MkdirTemp("", "auth-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	statePath := filepath.Join(tempDir, testAccID, "storage-state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	initialJSON := `{
+  "cookies": [
+    {"name": "SID", "value": "test-sid", "domain": ".google.com", "path": "/"}
+  ]
+}`
+	if err := os.WriteFile(statePath, []byte(initialJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 1. 测试读取
+	raw, err := ReadStorageStateRaw(statePath)
+	if err != nil {
+		t.Fatalf("ReadStorageStateRaw failed: %v", err)
+	}
+	if string(raw) != initialJSON {
+		t.Errorf("Expected raw=%s, got %s", initialJSON, string(raw))
+	}
+
+	// 2. 测试写入合法 JSON
+	updatedJSON := `{
+  "cookies": [
+    {"name": "SID", "value": "updated-sid", "domain": ".google.com", "path": "/"},
+    {"name": "__Secure-1PSIDTS", "value": "test-ts", "domain": ".google.com", "path": "/"}
+  ]
+}`
+	err = WriteStorageStateRaw(statePath, []byte(updatedJSON))
+	if err != nil {
+		t.Fatalf("WriteStorageStateRaw failed: %v", err)
+	}
+
+	readBack, _ := ReadStorageStateRaw(statePath)
+	if string(readBack) != updatedJSON {
+		t.Errorf("Expected updatedJSON, got %s", string(readBack))
+	}
+
+	// 3. 测试写入非法 JSON
+	err = WriteStorageStateRaw(statePath, []byte("{invalid-json"))
+	if err == nil {
+		t.Errorf("Expected error for invalid JSON, got nil")
+	}
+}
+
