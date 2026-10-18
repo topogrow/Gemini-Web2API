@@ -2,6 +2,7 @@ package admin
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/Mag1cFall/Gemini-Web2API/internal/balancer"
@@ -263,11 +264,16 @@ func (h *handler) updateStorageState(c *gin.Context) {
 	}
 	rawBytes := []byte(input.Content)
 	path := filepath.Join(h.Accounts.Settings().AuthDir, id, "storage-state.json")
-	if err := WriteStorageStateRaw(path, rawBytes); err != nil {
+	normalizedBytes, err := NormalizeStorageStatePayload(path, rawBytes)
+	if err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	importedID, err := h.Accounts.ImportState(rawBytes)
+	if err := os.WriteFile(path, normalizedBytes, 0o600); err != nil {
+		writeError(c, http.StatusInternalServerError, "write_file_failed", err.Error())
+		return
+	}
+	importedID, err := h.Accounts.ImportState(normalizedBytes)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "reload_account_failed", err.Error())
 		return
