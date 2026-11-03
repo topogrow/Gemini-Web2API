@@ -180,7 +180,7 @@ func (c *Client) init(ctx context.Context, allowRefresh bool) error {
 		return err
 	}
 	c.applyNavigationHeaders(req)
-	resp, err := c.httpClient.Do(req)
+	resp, err := doNavigationWithRedirects(ctx, c.httpClient, req, c.absorbResponseCookies)
 	if err != nil {
 		return transportProtocolError("bootstrap request", err)
 	}
@@ -805,7 +805,7 @@ func ProbeProxy(ctx context.Context, proxyURL string) (time.Duration, error) {
 	}
 	(&Client{language: defaultLanguage}).applyNavigationHeaders(req)
 	started := time.Now()
-	resp, err := httpClient.Do(req)
+	resp, err := doNavigationWithRedirects(ctx, httpClient, req, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -814,6 +814,86 @@ func ProbeProxy(ctx context.Context, proxyURL string) (time.Duration, error) {
 		return 0, responseStatusError(resp, "proxy probe")
 	}
 	return time.Since(started), nil
+}
+
+// doNavigationWithRedirects 自动处理 Google 访问时的重定向链，特别是 sorry/index 免检令牌的自动流转
+func doNavigationWithRedirects(ctx context.Context, client tls_client.HttpClient, initialReq *http.Request, absorbCookies func(*url.URL, *http.Response) error) (*http.Response, error) {
+	currentReq := initialReq
+	for hop := 0; hop < 6; hop++ {
+		resp, err := client.Do(currentReq)
+		if err != nil {
+			return nil, err
+		}
+		if absorbCookies != nil {
+			_ = absorbCookies(currentReq.URL, resp)
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		if resp.StatusCode != http.StatusFound &&
+			resp.StatusCode != http.StatusMovedPermanently &&
+			resp.StatusCode != http.StatusTemporaryRedirect {
+			return resp, nil
+		}
+		loc, err := resp.Location()
+		if err != nil || loc == nil {
+			return resp, nil
+		}
+		locStr := loc.String()
+		resp.Body.Close()
+
+		// 若重定向至 Google 登录页面，表明用户未登录或会话失效，结束重定向交由上层处理
+		if strings.Contains(locStr, "accounts.google.com/ServiceLogin") ||
+			strings.Contains(locStr, "accounts.google.com/InteractiveLogin") {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{locStr}},
+			}, nil
+		}
+
+		// 检查并提取可能携带的 google_abuse 免检令牌
+		if abuse := loc.Query().Get("google_abuse"); abuse != "" {
+			parts := strings.Split(abuse, ";")
+			if len(parts) > 0 {
+				kv := strings.SplitN(strings.TrimSpace(parts[0]), "=", 2)
+				if len(kv) == 2 && kv[0] == "GOOGLE_ABUSE_EXEMPTION" {
+					if jar := client.GetCookieJar(); jar != nil {
+						if u, err := url.Parse("https://google.com/"); err == nil {
+							jar.SetCookies(u, []*http.Cookie{{
+								Name:   kv[0],
+								Value:  kv[1],
+								Domain: ".google.com",
+								Path:   "/",
+							}})
+						}
+						if u, err := url.Parse("https://gemini.google.com/"); err == nil {
+							jar.SetCookies(u, []*http.Cookie{{
+								Name:   kv[0],
+								Value:  kv[1],
+								Domain: ".google.com",
+								Path:   "/",
+							}})
+						}
+					}
+				}
+			}
+		}
+
+		nextReq, err := http.NewRequestWithContext(ctx, http.MethodGet, locStr, nil)
+		if err != nil {
+			return nil, err
+		}
+		nextReq.Header.Set("user-agent", ChromeUserAgent)
+		nextReq.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+		if lang := currentReq.Header.Get("accept-language"); lang != "" {
+			nextReq.Header.Set("accept-language", lang)
+		} else {
+			nextReq.Header.Set("accept-language", defaultLanguage)
+		}
+		nextReq.Header.Set("referer", currentReq.URL.String())
+		currentReq = nextReq
+	}
+	return client.Do(currentReq)
 }
 
 // isAuthenticationError 判断错误是否为 HTTP 或帧内的 401、403，BardErrorInfo 1060 等出口限制不属于认证错误

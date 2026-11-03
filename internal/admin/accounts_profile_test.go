@@ -75,9 +75,20 @@ func TestAccountStorageState(t *testing.T) {
 	// 2. 测试写入合法 JSON
 	updatedJSON := `{
   "cookies": [
-    {"name": "SID", "value": "updated-sid", "domain": ".google.com", "path": "/"},
-    {"name": "__Secure-1PSIDTS", "value": "test-ts", "domain": ".google.com", "path": "/"}
-  ]
+    {
+      "domain": ".google.com",
+      "name": "SID",
+      "path": "/",
+      "value": "updated-sid"
+    },
+    {
+      "domain": ".google.com",
+      "name": "__Secure-1PSIDTS",
+      "path": "/",
+      "value": "test-ts"
+    }
+  ],
+  "origins": []
 }`
 	err = WriteStorageStateRaw(statePath, []byte(updatedJSON))
 	if err != nil {

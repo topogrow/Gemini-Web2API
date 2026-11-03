@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Mag1cFall/Gemini-Web2API/internal/gemini"
@@ -82,6 +83,9 @@ type cdpCookiesResult struct {
 
 // RefreshDarwin 以 Headless 无头模式唤醒独立 Profile，访问 gemini.google.com 刷新 __Secure-1PSIDTS
 func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer cancel()
+
 	profileDir, err := AccountProfileDir(accountID)
 	if err != nil {
 		return nil, err
@@ -92,7 +96,7 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
 	}
 
-	port := findFreePort(9222)
+	port := allocateDebugPort()
 	logging.Info(accountID, "正在启动静默无头 Chrome 执行 CDP 续签...", "Profile", profileDir, "调试端口", port)
 
 	args := []string{
@@ -108,7 +112,7 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	}
 	args = append(args, "https://gemini.google.com/app")
 
-	cmdCtx, cmdCancel := context.WithCancel(ctx)
+	cmdCtx, cmdCancel := context.WithCancel(refreshCtx)
 	defer cmdCancel()
 
 	cmd := exec.CommandContext(cmdCtx, chromePath, args...)
@@ -127,8 +131,8 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 
 	for time.Now().Before(deadline) {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-refreshCtx.Done():
+			return nil, refreshCtx.Err()
 		default:
 		}
 
@@ -160,7 +164,7 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	time.Sleep(3500 * time.Millisecond)
 
 	// 连接 CDP WebSocket 获取最新 Cookies
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(refreshCtx, wsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("连接 Chrome CDP 失败: %w", err)
 	}
@@ -169,9 +173,9 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	getCookiesReq := map[string]interface{}{
 		"id":     1,
 		"method": "Network.getCookies",
-		"params": map[string]interface{}{
-			"urls": []string{"https://google.com", "https://gemini.google.com"},
-		},
+				"params": map[string]interface{}{
+					"urls": []string{"https://google.com", "https://gemini.google.com", "https://accounts.google.com"},
+				},
 	}
 	reqBytes, _ := json.Marshal(getCookiesReq)
 	if err := conn.WriteMessage(websocket.TextMessage, reqBytes); err != nil {
@@ -226,7 +230,7 @@ func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.
 		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
 	}
 
-	port := findFreePort(9222)
+	port := allocateDebugPort()
 	logging.Info(accountID, "已启动独立 Chrome 窗口，请在浏览器中完成登录...", "Profile", profileDir)
 
 	args := []string{
@@ -298,7 +302,7 @@ func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.
 			"id":     1,
 			"method": "Network.getCookies",
 			"params": map[string]interface{}{
-				"urls": []string{"https://google.com", "https://gemini.google.com"},
+				"urls": []string{"https://google.com", "https://gemini.google.com", "https://accounts.google.com"},
 			},
 		}
 		reqBytes, _ := json.Marshal(getCookiesReq)
@@ -342,13 +346,24 @@ func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.
 	return nil, fmt.Errorf("登录超时或未完成")
 }
 
-func findFreePort(start int) int {
-	for p := start; p < start+200; p++ {
+var (
+	cdpPortMu   sync.Mutex
+	lastCdpPort = 9222
+)
+
+func allocateDebugPort() int {
+	cdpPortMu.Lock()
+	defer cdpPortMu.Unlock()
+	for p := lastCdpPort; p < 9999; p++ {
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err == nil {
 			_ = ln.Close()
+			lastCdpPort = p + 1
+			if lastCdpPort >= 9990 {
+				lastCdpPort = 9222
+			}
 			return p
 		}
 	}
-	return start
+	return 9222
 }
