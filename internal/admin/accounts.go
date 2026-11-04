@@ -186,6 +186,23 @@ func (h *handler) accountsByID(ids []string) []balancer.AccountStatus {
 	return result
 }
 
+// solveAccountCaptcha 以该账号的独立 Profile 启动可视化 Chrome 窗口供人工完成人机验证并自动解除拦截
+func (h *handler) solveAccountCaptcha(c *gin.Context) {
+	id := c.Param("id")
+	account, ok := h.account(id)
+	if !ok {
+		writeError(c, http.StatusNotFound, "account_not_found", "账号不存在")
+		return
+	}
+	importedID, err := h.Accounts.SolveCaptcha(c.Request.Context(), account.AccountID, account.Proxy)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "solve_captcha_failed", err.Error())
+		return
+	}
+	_ = h.Accounts.Verify(id)
+	h.respondAccount(c, importedID, nil)
+}
+
 // launchAccountBrowser 以该账号的独立 Profile 启动可视化 Chrome 窗口进行重登或进入
 func (h *handler) launchAccountBrowser(c *gin.Context) {
 	id := c.Param("id")

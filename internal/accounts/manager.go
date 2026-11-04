@@ -764,6 +764,57 @@ func (m *Manager) LoginAndImport(ctx context.Context, id, proxy string) (string,
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("写入认证状态: %w", err)
 	}
+	m.pool.ClearCooldown(cleanID)
+	return m.addFile(path)
+}
+
+// SolveCaptcha 在 macOS 下拉起独立 Chrome 窗口供用户手动解决人机验证，成功后提取免检 Cookie 覆盖写入并重启账号
+func (m *Manager) SolveCaptcha(ctx context.Context, id, proxy string) (string, error) {
+	if runtime.GOOS != "darwin" {
+		return "", errors.New("人工解除人机验证仅支持 macOS")
+	}
+	cleanID := chromeauth.AccountID(id)
+	if cleanID == "" {
+		return "", errors.New("账号名称不能为空")
+	}
+	cookies, err := chromeauth.SolveCaptchaDarwin(ctx, cleanID, proxy)
+	if err != nil {
+		return "", err
+	}
+	stateCookies := make([]auth.StateCookie, 0, len(cookies))
+	for _, c := range cookies {
+		stateCookies = append(stateCookies, auth.StateCookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Expires:  float64(c.Expires),
+			HTTPOnly: c.HTTPOnly,
+			Secure:   c.Secure,
+		})
+	}
+	state := auth.StorageState{
+		Cookies: stateCookies,
+		Origins: []json.RawMessage{},
+		Metadata: auth.Metadata{
+			ID:       cleanID,
+			Proxy:    proxy,
+			Source:   auth.ImportSource{Browser: "chrome-cdp-login", Profile: cleanID},
+			Language: "en-US,en;q=0.9",
+		},
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(m.Settings().AuthDir, cleanID, "storage-state.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("写入认证状态: %w", err)
+	}
+	m.pool.ClearCooldown(cleanID)
 	return m.addFile(path)
 }
 

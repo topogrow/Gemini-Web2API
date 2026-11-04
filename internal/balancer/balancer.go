@@ -384,6 +384,19 @@ func (p *AccountPool) ReportSuccess(accountID string, modelID string) {
 	}
 }
 
+// ClearCooldown 清除账号与其所有模型的冷却状态与上次错误
+func (p *AccountPool) ClearCooldown(accountID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if entry := p.entry(accountID); entry != nil {
+		entry.Cooldown = cooldown{}
+		entry.ModelCooldowns = make(map[string]cooldown)
+		entry.ConsecutiveFails = 0
+		entry.LastError = ""
+	}
+}
+
 // ReportFailure 按错误类型把账号或该模型移入冷却，会话失效时把账号标为待认证，网络层失败只记录错误
 func (p *AccountPool) ReportFailure(accountID string, modelID string, err error) {
 	p.mu.Lock()

@@ -57,6 +57,7 @@ func Mount(router *gin.Engine, deps Deps) {
 	api.PUT("/accounts/:id", h.updateAccount)
 	api.DELETE("/accounts/:id", h.deleteAccount)
 	api.POST("/accounts/:id/verify", h.verifyAccount)
+	api.POST("/accounts/:id/solve-captcha", h.solveAccountCaptcha)
 	api.POST("/accounts/:id/launch-browser", h.launchAccountBrowser)
 	api.POST("/accounts/:id/headless-refresh", h.headlessRefreshAccount)
 	api.POST("/accounts/:id/reset-profile", h.resetAccountProfile)

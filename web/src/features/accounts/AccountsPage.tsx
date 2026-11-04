@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, Globe, Power, PowerOff, ShieldCheck, Users } from 'lucide-react'
+import { ExternalLink, Globe, Power, PowerOff, ShieldAlert, ShieldCheck, Users } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
 
@@ -11,6 +11,7 @@ import { Table, Td, Th } from '@/components/ui/table'
 import { toast } from '@/components/ui/toast'
 import { Tooltip } from '@/components/ui/tooltip'
 import { runBatch } from '@/features/accounts/batch'
+import { isAccountCaptchaChallenged } from '@/features/accounts/captchaHelpers'
 import { accountsMessages, accountStateMessages } from '@/features/accounts/messages'
 import { fixedProxy } from '@/features/accounts/proxy'
 import { ProxyDialog } from '@/features/accounts/ProxyDialog'
@@ -128,6 +129,23 @@ export function AccountsPage() {
     },
     onError: (error) => {
       toast({ tone: 'error', title: '启动独立环境失败: ' + error.message })
+    },
+  })
+
+  const solveCaptcha = useMutation({
+    mutationFn: (account: Account) =>
+      api('/api/accounts/' + encodeURIComponent(account.account_id) + '/solve-captcha', {
+        method: 'POST',
+      }),
+    onSuccess: (_, account) => {
+      void client.invalidateQueries({ queryKey: accountsKey })
+      toast({
+        tone: 'success',
+        title: `✅ 账号 [${account.account_id}] 人机验证已解除并恢复就绪！`,
+      })
+    },
+    onError: (error) => {
+      toast({ tone: 'error', title: '解除人机验证失败: ' + error.message })
     },
   })
   return (
@@ -290,25 +308,51 @@ export function AccountsPage() {
                   </Td>
                   <Td className="whitespace-nowrap">
                     <div className="flex items-center gap-1.5">
-                      {account.has_profile ? (
-                        <Badge tone="success">已就绪</Badge>
+                      {isAccountCaptchaChallenged(account) ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="h-7 border border-warning/40 bg-warning-soft px-2 text-xs font-semibold text-warning-text hover:bg-warning/20"
+                          title="检测到人机验证拦截，点击在独立 Chrome 中完成验证并解除拦截"
+                          loading={solveCaptcha.isPending && solveCaptcha.variables?.account_id === account.account_id}
+                          onClick={(e) => {
+                            e.preventDefault()
+                            toast({
+                              tone: 'neutral',
+                              title: '正在打开 Chrome 验证窗口，请在浏览器中勾选人机验证...',
+                            })
+                            solveCaptcha.mutate(account)
+                          }}
+                        >
+                          <ShieldAlert size={14} className="mr-1 text-warning" />
+                          解除验证
+                        </Button>
                       ) : (
-                        <Badge tone="warning">未绑定</Badge>
+                        <>
+                          {account.has_profile ? (
+                            <Badge tone="success">已就绪</Badge>
+                          ) : (
+                            <Badge tone="warning">未绑定</Badge>
+                          )}
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="size-7"
+                            title={account.has_profile ? '打开专属独立窗口重登' : '创建专属沙盒并登录'}
+                            loading={
+                              launchBrowser.isPending &&
+                              launchBrowser.variables?.account_id === account.account_id
+                            }
+                            onClick={(e) => {
+                              e.preventDefault()
+                              toast({ tone: 'neutral', title: '正在拉起独立 Chrome 窗口...' })
+                              launchBrowser.mutate(account)
+                            }}
+                          >
+                            <ExternalLink size={14} aria-hidden />
+                          </Button>
+                        </>
                       )}
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        className="size-7"
-                        title={account.has_profile ? '打开专属独立窗口重登' : '创建专属沙盒并登录'}
-                        loading={launchBrowser.isPending && launchBrowser.variables?.account_id === account.account_id}
-                        onClick={(e) => {
-                          e.preventDefault()
-                          toast({ tone: 'neutral', title: '正在拉起独立 Chrome 窗口...' })
-                          launchBrowser.mutate(account)
-                        }}
-                      >
-                        <ExternalLink size={14} aria-hidden />
-                      </Button>
                     </div>
                   </Td>
                   <Td>{account.source === 'chrome' ? m.sourceChrome : m.sourceCookie}</Td>

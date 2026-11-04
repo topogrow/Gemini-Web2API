@@ -1,11 +1,12 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ExternalLink, FileCode, RefreshCw, Trash2 } from 'lucide-react'
+import { ExternalLink, FileCode, RefreshCw, ShieldAlert, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader, Section } from '@/components/ui/page'
 import { toast } from '@/components/ui/toast'
+import { isAccountCaptchaChallenged } from '@/features/accounts/captchaHelpers'
 import { accountsKey } from '@/features/accounts/queries'
 import { StorageStateDialog } from '@/features/accounts/StorageStateDialog'
 import type { Account } from '@/features/accounts/types'
@@ -68,6 +69,24 @@ export function AccountProfilePanel({ account }: AccountProfilePanelProps) {
     },
   })
 
+  // 4. 人工解除人机验证
+  const solveCaptcha = useMutation({
+    mutationFn: () =>
+      api('/api/accounts/' + encodeURIComponent(id) + '/solve-captcha', { method: 'POST' }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: accountsKey })
+      toast({
+        tone: 'success',
+        title: '✅ 人工验证完成，人机拦截已成功解除并重新就绪！',
+      })
+    },
+    onError: (error) => {
+      toast({ tone: 'error', title: '人工验证未完成或超时: ' + error.message })
+    },
+  })
+
+  const challenged = isAccountCaptchaChallenged(account)
+
   return (
     <Card>
       <CardHeader
@@ -81,6 +100,28 @@ export function AccountProfilePanel({ account }: AccountProfilePanelProps) {
         }
       />
       <div className="flex flex-col gap-4 px-5 py-4 text-sm">
+        {challenged && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-warning/40 bg-warning-soft px-4 py-3 text-warning-text">
+            <div className="flex items-center gap-2">
+              <ShieldAlert size={18} className="shrink-0 text-warning" />
+              <span>检测到该账号遭遇 Google 人机验证拦截，请点击右侧按钮在独立浏览器中完成点击验证。</span>
+            </div>
+            <Button
+              size="sm"
+              loading={solveCaptcha.isPending}
+              onClick={() => {
+                toast({
+                  tone: 'neutral',
+                  title: '正在打开 Chrome 验证窗口，请在浏览器中勾选人机验证...',
+                })
+                solveCaptcha.mutate()
+              }}
+            >
+              立即解除拦截
+            </Button>
+          </div>
+        )}
+
         <div className="flex flex-col gap-1 text-xs text-foreground-muted">
           <div>
             <span className="font-semibold text-foreground">物理隔离路径: </span>
@@ -157,6 +198,22 @@ export function AccountProfilePanel({ account }: AccountProfilePanelProps) {
           >
             <FileCode size={16} aria-hidden />
             修改 Cookie JSON
+          </Button>
+
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={solveCaptcha.isPending}
+            onClick={() => {
+              toast({
+                tone: 'neutral',
+                title: '正在拉起独立 Chrome 窗口，请在浏览器中勾选人机验证...',
+              })
+              solveCaptcha.mutate()
+            }}
+          >
+            <ShieldAlert size={16} aria-hidden />
+            人工验证 / 解除拦截
           </Button>
         </div>
       </div>

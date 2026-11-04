@@ -24,3 +24,7 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
 	return nil, fmt.Errorf("CDP 登录仅在 macOS 上生效")
 }
+
+func SolveCaptchaDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
+	return nil, fmt.Errorf("人工解除人机验证仅在 macOS 上生效")
+}
