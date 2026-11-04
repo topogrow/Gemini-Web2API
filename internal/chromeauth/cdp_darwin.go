@@ -23,18 +23,85 @@ import (
 	"github.com/bogdanfinn/websocket"
 )
 
-func cleanupProfileLocks(dir string) {
-	_ = os.Remove(filepath.Join(dir, "SingletonLock"))
-	_ = os.Remove(filepath.Join(dir, "SingletonCookie"))
-	_ = os.Remove(filepath.Join(dir, "SingletonSocket"))
-}
-
-func killProfileZombies(dir string) {
+func cleanupProfileLocksAndState(dir string) {
 	if dir == "" {
 		return
 	}
-	_ = exec.Command("pkill", "-9", "-f", "--user-data-dir="+dir).Run()
-	cleanupProfileLocks(dir)
+	// 1. 清理根目录单例软链与版本锁
+	_ = os.Remove(filepath.Join(dir, "SingletonLock"))
+	_ = os.Remove(filepath.Join(dir, "SingletonCookie"))
+	_ = os.Remove(filepath.Join(dir, "SingletonSocket"))
+	_ = os.Remove(filepath.Join(dir, "RunningChromeVersion"))
+
+	// 2. 递归查找并删除残留的 LevelDB LOCK 文件与 SQLite journal/wal 文件
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if !info.IsDir() {
+			name := info.Name()
+			if name == "LOCK" || strings.HasSuffix(name, "-journal") || strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm") {
+				_ = os.Remove(path)
+			}
+		}
+		return nil
+	})
+
+	// 3. 修复 Default/Preferences 中的 exit_type 与 exited_cleanly，彻底消除 Chrome "打开您的个人资料时出了点问题" 弹窗
+	prefPath := filepath.Join(dir, "Default", "Preferences")
+	if data, err := os.ReadFile(prefPath); err == nil {
+		var m map[string]interface{}
+		if json.Unmarshal(data, &m) == nil {
+			modified := false
+			if prof, ok := m["profile"].(map[string]interface{}); ok {
+				if prof["exit_type"] != "Normal" || prof["exited_cleanly"] != true {
+					prof["exit_type"] = "Normal"
+					prof["exited_cleanly"] = true
+					modified = true
+				}
+			}
+			if modified {
+				if newData, err := json.Marshal(m); err == nil {
+					_ = os.WriteFile(prefPath, newData, 0o600)
+				}
+			}
+		}
+	}
+
+	// 4. 重置 Local State 中的 variations_crash_streak 计数
+	localStatePath := filepath.Join(dir, "Local State")
+	if data, err := os.ReadFile(localStatePath); err == nil {
+		var m map[string]interface{}
+		if json.Unmarshal(data, &m) == nil {
+			if streak, ok := m["variations_crash_streak"].(float64); ok && streak > 0 {
+				m["variations_crash_streak"] = 0
+				if newData, err := json.Marshal(m); err == nil {
+					_ = os.WriteFile(localStatePath, newData, 0o600)
+				}
+			}
+		}
+	}
+}
+
+func killProfileZombies(accountID string, dir string) {
+	if accountID != "" {
+		_ = exec.Command("pkill", "-9", "-f", "profiles/"+accountID).Run()
+		_ = exec.Command("pkill", "-9", "-f", "--user-data-dir=.*"+accountID).Run()
+	}
+	if dir != "" {
+		out, err := exec.Command("lsof", "-t", "+D", dir).Output()
+		if err == nil && len(out) > 0 {
+			pids := strings.Fields(string(out))
+			for _, pidStr := range pids {
+				var pid int
+				if _, err := fmt.Sscanf(pidStr, "%d", &pid); err == nil && pid > 1 {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	cleanupProfileLocksAndState(dir)
 }
 
 const defaultMacChromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -208,8 +275,8 @@ func launchInteractiveChrome(accountID string, proxy string, initialURL string) 
 		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
 	}
 
-	// 杀掉针对此目录的残留孤儿/僵尸进程并清理文件锁
-	killProfileZombies(profileDir)
+	// 杀掉针对此账号目录的残留孤儿/僵尸进程并彻底清理文件锁与异常崩溃标记
+	killProfileZombies(accountID, profileDir)
 
 	port := allocateDebugPort()
 	args := []string{
@@ -217,6 +284,9 @@ func launchInteractiveChrome(accountID string, proxy string, initialURL string) 
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--password-store=basic",
+		"--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints",
+		"--disable-sync",
 		"--window-size=1280,800",
 	}
 	if proxy != "" {
@@ -254,6 +324,7 @@ func launchInteractiveChrome(accountID string, proxy string, initialURL string) 
 		}
 		interactiveMu.Unlock()
 		close(sess.CloseChan)
+		cleanupProfileLocksAndState(profileDir)
 		logging.Info(accountID, "独立 Chrome 窗口已由用户手动关闭。")
 	}()
 
@@ -298,44 +369,48 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 
 	existingCookies, _ := loadExistingStorageCookies(accountID)
 
-	// 清理残留进程并释放锁
-	killProfileZombies(profileDir)
+		// 清理残留进程并释放锁与崩溃标记
+		killProfileZombies(accountID, profileDir)
 
-	port := allocateDebugPort()
-	logging.Info(accountID, "正在启动静默无头 Chrome 执行 CDP 续签...", "Profile", profileDir, "调试端口", port, "注入Cookie数", len(existingCookies))
+		port := allocateDebugPort()
+		logging.Info(accountID, "正在启动静默无头 Chrome 执行 CDP 续签...", "Profile", profileDir, "调试端口", port, "注入Cookie数", len(existingCookies))
 
-	args := []string{
-		"--user-data-dir=" + profileDir,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--headless=new",
-		"--disable-gpu",
-		"--no-first-run",
-		"--no-default-browser-check",
-	}
-	if proxy != "" {
-		args = append(args, "--proxy-server="+proxy)
-	}
-	args = append(args, "about:blank")
-
-	cmdCtx, cmdCancel := context.WithCancel(refreshCtx)
-	defer cmdCancel()
-
-	cmd := exec.CommandContext(cmdCtx, chromePath, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 Chrome 失败: %w", err)
-	}
-	defer func() {
-		if cmd.Process != nil {
-			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			} else {
-				_ = cmd.Process.Kill()
-			}
-			_ = cmd.Wait()
+		args := []string{
+			"--user-data-dir=" + profileDir,
+			fmt.Sprintf("--remote-debugging-port=%d", port),
+			"--headless=new",
+			"--disable-gpu",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--password-store=basic",
+			"--disable-features=Translate,OptimizationGuideModelDownloading,OptimizationHints",
+			"--disable-sync",
 		}
-	}()
+		if proxy != "" {
+			args = append(args, "--proxy-server="+proxy)
+		}
+		args = append(args, "about:blank")
+
+		cmdCtx, cmdCancel := context.WithCancel(refreshCtx)
+		defer cmdCancel()
+
+		cmd := exec.CommandContext(cmdCtx, chromePath, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("启动 Chrome 失败: %w", err)
+		}
+		defer func() {
+			if cmd.Process != nil {
+				if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+					_ = syscall.Kill(-pgid, syscall.SIGKILL)
+				} else {
+					_ = cmd.Process.Kill()
+				}
+				_ = cmd.Wait()
+			}
+			cleanupProfileLocksAndState(profileDir)
+		}()
 
 	// 轮询等待 Chrome 调试端口就绪并抓取 WebSocket 目标
 	var wsURL string
