@@ -5,6 +5,7 @@ package chromeauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Mag1cFall/Gemini-Web2API/internal/gemini"
@@ -25,6 +27,14 @@ func cleanupProfileLocks(dir string) {
 	_ = os.Remove(filepath.Join(dir, "SingletonLock"))
 	_ = os.Remove(filepath.Join(dir, "SingletonCookie"))
 	_ = os.Remove(filepath.Join(dir, "SingletonSocket"))
+}
+
+func killProfileZombies(dir string) {
+	if dir == "" {
+		return
+	}
+	_ = exec.Command("pkill", "-9", "-f", "--user-data-dir="+dir).Run()
+	cleanupProfileLocks(dir)
 }
 
 const defaultMacChromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -139,10 +149,139 @@ func loadExistingStorageCookies(accountID string) ([]cdpCookieParam, error) {
 	return params, nil
 }
 
+// interactiveSession 管理当前正在运行的可见独立 Chrome 窗口
+type interactiveSession struct {
+	AccountID     string
+	ProfileDir    string
+	Port          int
+	Cmd           *exec.Cmd
+	StartedAt     time.Time
+	CloseChan     chan struct{}
+	LatestCookies []gemini.Cookie
+	mu            sync.RWMutex
+}
+
+var (
+	interactiveMu       sync.Mutex
+	interactiveSessions = make(map[string]*interactiveSession)
+)
+
+// IsInteractiveBrowserOpen 检查该账号是否正在打开独立的可视化 Chrome 窗口
+func IsInteractiveBrowserOpen(accountID string) bool {
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+	sess, ok := interactiveSessions[accountID]
+	if !ok || sess == nil {
+		return false
+	}
+	if sess.Cmd != nil && sess.Cmd.Process != nil {
+		if err := sess.Cmd.Process.Signal(syscall.Signal(0)); err == nil {
+			return true
+		}
+	}
+	delete(interactiveSessions, accountID)
+	return false
+}
+
+// launchInteractiveChrome 启动可视化独立 Chrome 窗口，并在后台长期运行，绝不主动 kill 窗口
+func launchInteractiveChrome(accountID string, proxy string, initialURL string) (*interactiveSession, error) {
+	interactiveMu.Lock()
+	defer interactiveMu.Unlock()
+
+	// 1. 如果已有活着的交互窗口，激活并返回
+	if sess, ok := interactiveSessions[accountID]; ok && sess != nil {
+		if sess.Cmd != nil && sess.Cmd.Process != nil && sess.Cmd.Process.Signal(syscall.Signal(0)) == nil {
+			logging.Info(accountID, "独立 Chrome 窗口已在运行中，复用该窗口...")
+			_ = exec.Command("osascript", "-e", `tell application "Google Chrome" to activate`).Run()
+			return sess, nil
+		}
+		delete(interactiveSessions, accountID)
+	}
+
+	profileDir, err := AccountProfileDir(accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	chromePath := MacChromeExecutable()
+	if _, err := os.Stat(chromePath); err != nil {
+		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
+	}
+
+	// 杀掉针对此目录的残留孤儿/僵尸进程并清理文件锁
+	killProfileZombies(profileDir)
+
+	port := allocateDebugPort()
+	args := []string{
+		"--user-data-dir=" + profileDir,
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--window-size=1280,800",
+	}
+	if proxy != "" {
+		args = append(args, "--proxy-server="+proxy)
+	}
+	if initialURL == "" {
+		initialURL = "https://gemini.google.com/app"
+	}
+	args = append(args, initialURL)
+
+	// 使用独立上下文启动 Chrome，脱离单次 HTTP 请求的生命周期！
+	cmd := exec.Command(chromePath, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("启动 Chrome 窗口失败: %w", err)
+	}
+
+	sess := &interactiveSession{
+		AccountID:  accountID,
+		ProfileDir: profileDir,
+		Port:       port,
+		Cmd:        cmd,
+		StartedAt:  time.Now(),
+		CloseChan:  make(chan struct{}),
+	}
+	interactiveSessions[accountID] = sess
+
+	// 监听进程自然退出（由用户手动关闭窗口触发）
+	go func() {
+		_ = cmd.Wait()
+		interactiveMu.Lock()
+		if interactiveSessions[accountID] == sess {
+			delete(interactiveSessions, accountID)
+		}
+		interactiveMu.Unlock()
+		close(sess.CloseChan)
+		logging.Info(accountID, "独立 Chrome 窗口已由用户手动关闭。")
+	}()
+
+	logging.Info(accountID, "已成功拉起独立 Chrome 窗口！", "Profile", profileDir, "调试端口", port)
+	return sess, nil
+}
+
 // RefreshDarwin 以 Headless 无头模式唤醒独立 Profile，访问 gemini.google.com 刷新 __Secure-1PSIDTS
 func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
 	cdpRefreshLock.Lock()
 	defer cdpRefreshLock.Unlock()
+
+	// 1. 如果该账号当前已经有可视化 Chrome 窗口在运行，直接从该窗口提取最新 Cookie，避免同时启动两个 Chrome 导致崩溃！
+	if IsInteractiveBrowserOpen(accountID) {
+		logging.Info(accountID, "检测到独立 Chrome 可视化窗口正在运行，直接从当前窗口提取最新 Cookie...")
+		interactiveMu.Lock()
+		sess := interactiveSessions[accountID]
+		interactiveMu.Unlock()
+		if sess != nil {
+			cookies, err := fetchCookiesFromPort(sess.Port)
+			if err == nil && len(cookies) > 0 {
+				sess.mu.Lock()
+				sess.LatestCookies = cookies
+				sess.mu.Unlock()
+				return cookies, nil
+			}
+		}
+	}
 
 	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
 	defer cancel()
@@ -158,6 +297,9 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	}
 
 	existingCookies, _ := loadExistingStorageCookies(accountID)
+
+	// 清理残留进程并释放锁
+	killProfileZombies(profileDir)
 
 	port := allocateDebugPort()
 	logging.Info(accountID, "正在启动静默无头 Chrome 执行 CDP 续签...", "Profile", profileDir, "调试端口", port, "注入Cookie数", len(existingCookies))
@@ -175,18 +317,22 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	}
 	args = append(args, "about:blank")
 
-	cleanupProfileLocks(profileDir)
-
 	cmdCtx, cmdCancel := context.WithCancel(refreshCtx)
 	defer cmdCancel()
 
 	cmd := exec.CommandContext(cmdCtx, chromePath, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("启动 Chrome 失败: %w", err)
 	}
 	defer func() {
 		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Kill()
+			}
 			_ = cmd.Wait()
 		}
 	}()
@@ -234,7 +380,7 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	}
 	defer conn.Close()
 
-	// 1. 若有存量 Cookie（如用户粘贴的 JSON），先向 Chrome 注入确保会话就绪
+	// 1. 若有存量 Cookie，先注入确保会话就绪
 	if len(existingCookies) > 0 {
 		setCookiesReq := map[string]interface{}{
 			"id":     1,
@@ -311,401 +457,284 @@ func RefreshDarwin(ctx context.Context, accountID string, proxy string) ([]gemin
 	return result, nil
 }
 
-// LoginDarwin 唤起可见的 Chrome 独立窗口，供用户进行首次登录或重登，登录完成后自动提取 Cookies
+// LoginDarwin 唤起可见的 Chrome 独立窗口供用户登录。检测到登录成功后提取 Cookies 并返回，但绝不关闭 Chrome 窗口！
 func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
-	profileDir, err := AccountProfileDir(accountID)
+	sess, err := launchInteractiveChrome(accountID, proxy, "https://gemini.google.com/app")
 	if err != nil {
 		return nil, err
 	}
 
-	chromePath := MacChromeExecutable()
-	if _, err := os.Stat(chromePath); err != nil {
-		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
-	}
-
-	port := allocateDebugPort()
-	logging.Info(accountID, "已启动独立 Chrome 窗口，请在浏览器中完成登录...", "Profile", profileDir)
-
-	args := []string{
-		"--user-data-dir=" + profileDir,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--window-size=1280,800",
-	}
-	if proxy != "" {
-		args = append(args, "--proxy-server="+proxy)
-	}
-	args = append(args, "https://gemini.google.com/app")
-
-	cleanupProfileLocks(profileDir)
-
-	cmdCtx, cmdCancel := context.WithCancel(ctx)
-	defer cmdCancel()
-
-	cmd := exec.CommandContext(cmdCtx, chromePath, args...)
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 Chrome 窗口失败: %w", err)
-	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
-	}()
-
-	chromeExited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(chromeExited)
-	}()
-
-	httpClient := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// 最长等待 10 分钟供用户扫码或输入密码登录
+	// 最长等待 10 分钟供用户在窗口内扫码或输入密码登录
 	deadline := time.Now().Add(10 * time.Minute)
 
 	for time.Now().Before(deadline) {
 		select {
+		case <-sess.CloseChan:
+			sess.mu.RLock()
+			cookies := sess.LatestCookies
+			sess.mu.RUnlock()
+			if len(cookies) > 0 {
+				return cookies, nil
+			}
+			return nil, fmt.Errorf("浏览器窗口已被手动关闭，未完成登录")
 		case <-ctx.Done():
+			// 即使 HTTP 请求断开，后台 Chrome 依然保持开启供用户操作
+			sess.mu.RLock()
+			cookies := sess.LatestCookies
+			sess.mu.RUnlock()
+			if len(cookies) > 0 {
+				return cookies, nil
+			}
 			return nil, ctx.Err()
-		case <-chromeExited:
-			return nil, fmt.Errorf("浏览器窗口已手动关闭，未完成登录")
 		case <-ticker.C:
 		}
 
-		resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
-		if err != nil {
+		cookies, err := fetchCookiesFromPort(sess.Port)
+		if err != nil || len(cookies) == 0 {
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
 
-		var targets []cdpTarget
-		var wsURL string
-		if json.Unmarshal(body, &targets) == nil {
-			for _, t := range targets {
-				if t.Type == "page" && t.WebSocketDebuggerURL != "" &&
-					strings.HasPrefix(t.URL, "https://gemini.google.com") &&
-					!strings.Contains(t.URL, "accounts.google.com") &&
-					!strings.Contains(t.URL, "sorry/index") {
-					wsURL = t.WebSocketDebuggerURL
-					break
-				}
+		hasSidts := false
+		for _, c := range cookies {
+			if c.Name == "__Secure-1PSIDTS" {
+				hasSidts = true
+				break
 			}
 		}
 
-		if wsURL == "" {
-			continue
-		}
+		// 必须已经离开 Google 账号登录页 (accounts.google.com)，并位于 gemini.google.com
+		if hasSidts && isGeminiAppReady(sess.Port) {
+			sess.mu.Lock()
+			sess.LatestCookies = cookies
+			sess.mu.Unlock()
 
-		conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
-		if err != nil {
-			continue
-		}
-
-		// 检查页面 DOM 中是否已载入登录态令牌 SNlM0e（证明真正登录成功并进入对话界面）
-		evalReq := map[string]interface{}{
-			"id": 10,
-			"method": "Runtime.evaluate",
-			"params": map[string]interface{}{
-				"expression":    "document.documentElement.outerHTML.includes(\"SNlM0e\")",
-				"returnByValue": true,
-			},
-		}
-		evalBytes, _ := json.Marshal(evalReq)
-		_ = conn.WriteMessage(websocket.TextMessage, evalBytes)
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, evalMsg, err := conn.ReadMessage()
-		if err != nil {
-			conn.Close()
-			continue
-		}
-
-		var evalRes struct {
-			Result struct {
-				Result struct {
-					Value bool `json:"value"`
-				} `json:"result"`
-			} `json:"result"`
-		}
-		if json.Unmarshal(evalMsg, &evalRes) != nil || !evalRes.Result.Result.Value {
-			conn.Close()
-			continue
-		}
-
-		getCookiesReq := map[string]interface{}{
-			"id":     1,
-			"method": "Network.getCookies",
-			"params": map[string]interface{}{
-				"urls": []string{"https://google.com", "https://gemini.google.com", "https://accounts.google.com"},
-			},
-		}
-		reqBytes, _ := json.Marshal(getCookiesReq)
-		_ = conn.WriteMessage(websocket.TextMessage, reqBytes)
-		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		_, msg, err := conn.ReadMessage()
-		conn.Close()
-
-		if err != nil {
-			continue
-		}
-
-		var res cdpCookiesResult
-		if json.Unmarshal(msg, &res) == nil {
-			hasSidts := false
-			for _, c := range res.Result.Cookies {
-				if c.Name == "__Secure-1PSIDTS" {
-					hasSidts = true
-					break
-				}
-			}
-			if hasSidts {
-				result := make([]gemini.Cookie, 0, len(res.Result.Cookies))
-				for _, c := range res.Result.Cookies {
-					result = append(result, gemini.Cookie{
-						Name:     c.Name,
-						Value:    c.Value,
-						Domain:   c.Domain,
-						Path:     c.Path,
-						Expires:  int64(c.Expires),
-						HTTPOnly: c.HTTPOnly,
-						Secure:   c.Secure,
-					})
-				}
-				time.Sleep(1500 * time.Millisecond)
-				logging.Info(accountID, "检测到登录成功，Cookies 凭据已就绪！", "数量", len(result))
-				return result, nil
-			}
+			logging.Info(accountID, "检测到登录成功，Cookies 凭据已就绪（Chrome 窗口保持开启供使用）！", "数量", len(cookies))
+			return cookies, nil
 		}
 	}
 
-		return nil, fmt.Errorf("登录超时或未完成")
-	}
+	return nil, fmt.Errorf("登录超时或未完成")
+}
 
-// SolveCaptchaDarwin 唤起可见 Chrome 独立窗口供用户进行人工滑块/人机验证，验证完成后自动提取包含 GOOGLE_ABUSE_EXEMPTION 在内的全量凭据
+// SolveCaptchaDarwin 唤起可见 Chrome 独立窗口供用户人工解除人机验证。验证完成后提取 Cookies 并返回，但绝不关闭 Chrome 窗口！
 func SolveCaptchaDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
-	profileDir, err := AccountProfileDir(accountID)
-	if err != nil {
-		return nil, err
-	}
-
-	chromePath := MacChromeExecutable()
-	if _, err := os.Stat(chromePath); err != nil {
-		return nil, fmt.Errorf("未检测到本地 Google Chrome: %s", chromePath)
-	}
-
 	existingCookies, _ := loadExistingStorageCookies(accountID)
 
-	port := allocateDebugPort()
-	logging.Info(accountID, "已启动独立 Chrome 窗口，请在浏览器中完成人机验证...", "Profile", profileDir, "注入Cookie数", len(existingCookies))
-
-	args := []string{
-		"--user-data-dir=" + profileDir,
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--window-size=1280,800",
+	sess, err := launchInteractiveChrome(accountID, proxy, "about:blank")
+	if err != nil {
+		return nil, err
 	}
-	if proxy != "" {
-		args = append(args, "--proxy-server="+proxy)
-	}
-	args = append(args, "about:blank")
 
-	cleanupProfileLocks(profileDir)
-
-	cmdCtx, cmdCancel := context.WithCancel(ctx)
-	defer cmdCancel()
-
-	cmd := exec.CommandContext(cmdCtx, chromePath, args...)
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("启动 Chrome 窗口失败: %w", err)
-	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
-	}()
-
-	chromeExited := make(chan struct{})
+	// 注入已有 Cookie 并导航到 gemini.google.com/app
 	go func() {
-		_ = cmd.Wait()
-		close(chromeExited)
+		time.Sleep(1 * time.Second)
+		injectCookiesAndNavigate(sess.Port, existingCookies, "https://gemini.google.com/app")
 	}()
 
-	httpClient := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	deadline := time.Now().Add(10 * time.Minute)
-	injected := false
 
 	for time.Now().Before(deadline) {
 		select {
+		case <-sess.CloseChan:
+			sess.mu.RLock()
+			cookies := sess.LatestCookies
+			sess.mu.RUnlock()
+			if len(cookies) > 0 {
+				return cookies, nil
+			}
+			return nil, fmt.Errorf("验证窗口已被手动关闭，未完成验证")
 		case <-ctx.Done():
+			sess.mu.RLock()
+			cookies := sess.LatestCookies
+			sess.mu.RUnlock()
+			if len(cookies) > 0 {
+				return cookies, nil
+			}
 			return nil, ctx.Err()
-		case <-chromeExited:
-			return nil, fmt.Errorf("浏览器窗口已手动关闭，未完成验证")
 		case <-ticker.C:
 		}
 
-		resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
-		if err != nil {
+		cookies, err := fetchCookiesFromPort(sess.Port)
+		if err != nil || len(cookies) == 0 {
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
 
-		var targets []cdpTarget
-		var wsURL string
-		if json.Unmarshal(body, &targets) == nil {
-			for _, t := range targets {
-				if t.Type == "page" && t.WebSocketDebuggerURL != "" {
-					wsURL = t.WebSocketDebuggerURL
-					break
-				}
+		hasAbuse := false
+		hasSidts := false
+		for _, c := range cookies {
+			if c.Name == "GOOGLE_ABUSE_EXEMPTION" {
+				hasAbuse = true
+			}
+			if c.Name == "__Secure-1PSIDTS" {
+				hasSidts = true
 			}
 		}
 
-		if wsURL == "" {
-			continue
-		}
+		// 获得免检 Cookie 或成功进入 Gemini 主页
+		if hasAbuse || (hasSidts && isGeminiAppReady(sess.Port)) {
+			sess.mu.Lock()
+			sess.LatestCookies = cookies
+			sess.mu.Unlock()
 
-		conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
-		if err != nil {
-			continue
-		}
-
-		// 首次连接：注入已有 Cookies 并导航至 Gemini
-		if !injected {
-			if len(existingCookies) > 0 {
-				setCookiesReq := map[string]interface{}{
-					"id":     1,
-					"method": "Network.setCookies",
-					"params": map[string]interface{}{
-						"cookies": existingCookies,
-					},
-				}
-				reqBytes, _ := json.Marshal(setCookiesReq)
-				_ = conn.WriteMessage(websocket.TextMessage, reqBytes)
-				_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-				_, _, _ = conn.ReadMessage()
-			}
-
-			navReq := map[string]interface{}{
-				"id":     2,
-				"method": "Page.navigate",
-				"params": map[string]interface{}{
-					"url": "https://gemini.google.com/app",
-				},
-			}
-			navBytes, _ := json.Marshal(navReq)
-			_ = conn.WriteMessage(websocket.TextMessage, navBytes)
-			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-			_, _, _ = conn.ReadMessage()
-			injected = true
-			conn.Close()
-			continue
-		}
-
-		// 已完成导航：检查页面是否脱离 sorry 拦截并进入 Gemini
-		var onGeminiPage bool
-		if json.Unmarshal(body, &targets) == nil {
-			for _, t := range targets {
-				if t.Type == "page" && strings.HasPrefix(t.URL, "https://gemini.google.com") &&
-					!strings.Contains(t.URL, "accounts.google.com") &&
-					!strings.Contains(t.URL, "sorry/index") {
-					onGeminiPage = true
-					break
-				}
-			}
-		}
-
-		if !onGeminiPage {
-			conn.Close()
-			continue
-		}
-
-		// 检查页面 DOM 中是否已载入登录态令牌 SNlM0e（证明真正通过验证并进入 Gemini 界面）
-		evalReq := map[string]interface{}{
-			"id": 10,
-			"method": "Runtime.evaluate",
-			"params": map[string]interface{}{
-				"expression":    "document.documentElement.outerHTML.includes(\"SNlM0e\")",
-				"returnByValue": true,
-			},
-		}
-		evalBytes, _ := json.Marshal(evalReq)
-		_ = conn.WriteMessage(websocket.TextMessage, evalBytes)
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, evalMsg, err := conn.ReadMessage()
-		if err != nil {
-			conn.Close()
-			continue
-		}
-
-		var evalRes struct {
-			Result struct {
-				Result struct {
-					Value bool `json:"value"`
-				} `json:"result"`
-			} `json:"result"`
-		}
-		if json.Unmarshal(evalMsg, &evalRes) != nil || !evalRes.Result.Result.Value {
-			conn.Close()
-			continue
-		}
-
-		getCookiesReq := map[string]interface{}{
-			"id":     3,
-			"method": "Network.getCookies",
-			"params": map[string]interface{}{
-				"urls": []string{"https://google.com", "https://gemini.google.com", "https://accounts.google.com"},
-			},
-		}
-		reqBytes, _ := json.Marshal(getCookiesReq)
-		_ = conn.WriteMessage(websocket.TextMessage, reqBytes)
-		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		_, msg, err := conn.ReadMessage()
-		conn.Close()
-
-		if err != nil {
-			continue
-		}
-
-		var res cdpCookiesResult
-		if json.Unmarshal(msg, &res) == nil {
-			hasSidts := false
-			for _, c := range res.Result.Cookies {
-				if c.Name == "__Secure-1PSIDTS" {
-					hasSidts = true
-					break
-				}
-			}
-			if hasSidts {
-				result := make([]gemini.Cookie, 0, len(res.Result.Cookies))
-				for _, c := range res.Result.Cookies {
-					result = append(result, gemini.Cookie{
-						Name:     c.Name,
-						Value:    c.Value,
-						Domain:   c.Domain,
-						Path:     c.Path,
-						Expires:  int64(c.Expires),
-						HTTPOnly: c.HTTPOnly,
-						Secure:   c.Secure,
-					})
-				}
-				time.Sleep(1500 * time.Millisecond)
-				logging.Info(accountID, "人工验证完成，已捕获最新免检 Cookies！", "数量", len(result))
-				return result, nil
-			}
+			logging.Info(accountID, "人工验证完成，已捕获最新凭据（Chrome 窗口保持开启供使用）！", "数量", len(cookies))
+			return cookies, nil
 		}
 	}
 
 	return nil, fmt.Errorf("人工验证超时或未完成")
+}
+
+func fetchCookiesFromPort(port int) ([]gemini.Cookie, error) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var targets []cdpTarget
+	if err := json.Unmarshal(body, &targets); err != nil {
+		return nil, err
+	}
+
+	var wsURL string
+	for _, t := range targets {
+		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
+			wsURL = t.WebSocketDebuggerURL
+			break
+		}
+	}
+	if wsURL == "" {
+		return nil, errors.New("未找到 page 目标")
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	getCookiesReq := map[string]interface{}{
+		"id":     99,
+		"method": "Network.getCookies",
+		"params": map[string]interface{}{
+			"urls": []string{"https://google.com", "https://gemini.google.com", "https://accounts.google.com"},
+		},
+	}
+	reqBytes, _ := json.Marshal(getCookiesReq)
+	if err := conn.WriteMessage(websocket.TextMessage, reqBytes); err != nil {
+		return nil, err
+	}
+
+	msg, err := readCdpMessageByID(conn, 99, 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	var res cdpCookiesResult
+	if err := json.Unmarshal(msg, &res); err != nil {
+		return nil, err
+	}
+
+	result := make([]gemini.Cookie, 0, len(res.Result.Cookies))
+	for _, c := range res.Result.Cookies {
+		result = append(result, gemini.Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Expires:  int64(c.Expires),
+			HTTPOnly: c.HTTPOnly,
+			Secure:   c.Secure,
+		})
+	}
+	return result, nil
+}
+
+func isGeminiAppReady(port int) bool {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var targets []cdpTarget
+	if json.Unmarshal(body, &targets) != nil {
+		return false
+	}
+	for _, t := range targets {
+		if t.Type == "page" {
+			// 如果有 accounts.google.com 页面，说明还在登录页面
+			if strings.Contains(t.URL, "accounts.google.com") {
+				return false
+			}
+			if strings.HasPrefix(t.URL, "https://gemini.google.com") && !strings.Contains(t.URL, "sorry/index") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func injectCookiesAndNavigate(port int, cookies []cdpCookieParam, targetURL string) {
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var targets []cdpTarget
+	if json.Unmarshal(body, &targets) != nil {
+		return
+	}
+
+	var wsURL string
+	for _, t := range targets {
+		if t.Type == "page" && t.WebSocketDebuggerURL != "" {
+			wsURL = t.WebSocketDebuggerURL
+			break
+		}
+	}
+	if wsURL == "" {
+		return
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	if len(cookies) > 0 {
+		setCookiesReq := map[string]interface{}{
+			"id":     1,
+			"method": "Network.setCookies",
+			"params": map[string]interface{}{
+				"cookies": cookies,
+			},
+		}
+		reqBytes, _ := json.Marshal(setCookiesReq)
+		_ = conn.WriteMessage(websocket.TextMessage, reqBytes)
+		_, _ = readCdpMessageByID(conn, 1, 3*time.Second)
+	}
+
+	if targetURL != "" {
+		navReq := map[string]interface{}{
+			"id":     2,
+			"method": "Page.navigate",
+			"params": map[string]interface{}{
+				"url": targetURL,
+			},
+		}
+		navBytes, _ := json.Marshal(navReq)
+		_ = conn.WriteMessage(websocket.TextMessage, navBytes)
+		_, _ = readCdpMessageByID(conn, 2, 3*time.Second)
+	}
 }
 
 var (

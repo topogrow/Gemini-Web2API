@@ -28,3 +28,7 @@ func LoginDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.
 func SolveCaptchaDarwin(ctx context.Context, accountID string, proxy string) ([]gemini.Cookie, error) {
 	return nil, fmt.Errorf("人工解除人机验证仅在 macOS 上生效")
 }
+
+func IsInteractiveBrowserOpen(accountID string) bool {
+	return false
+}
