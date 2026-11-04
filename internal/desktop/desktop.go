@@ -81,7 +81,8 @@ func Run(options Options) error {
 		Name: options.Title,
 		Icon: icon,
 		Mac: application.MacOptions{
-			ActivationPolicy: application.ActivationPolicyRegular,
+			ActivationPolicy:                                application.ActivationPolicyRegular,
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
 		},
 		Windows: application.WindowsOptions{WebviewUserDataPath: dataDir},
 		RawMessageHandler: func(_ application.Window, message string, _ *application.OriginInfo) {

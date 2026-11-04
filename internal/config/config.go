@@ -14,7 +14,7 @@ const (
 	defaultListenAddress = "127.0.0.1:8007"
 	defaultCooldown      = 2 * time.Minute
 	defaultSessionTTL    = 30 * time.Minute
-	defaultInitTimeout   = 20 * time.Second
+	defaultInitTimeout   = 60 * time.Second
 )
 
 // Config 保存服务启动所需的全部配置
