@@ -47,12 +47,22 @@ func NewHTTPClient(timeoutSeconds int, proxyURL string) (tls_client.HttpClient, 
 		Timeout:   30 * time.Second,
 		KeepAlive: 15 * time.Second,
 	}
+	// 视频生成等长耗时任务在上游渲染期间可能数十秒没有任何数据帧，
+	// 代理节点/NAT 网关会把这种静默连接判定为僵尸连接并掐断，表现为
+	// "tls: bad record MAC" 或 EOF。开启 HTTP/2 PING 健康检查后，只要
+	// 连接静默达到 ReadIdleTimeout 就会主动发送 PING 帧维持链路活性。
+	readIdle := 25 * time.Second
+	pingTimeout := 10 * time.Second
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(timeoutSeconds),
 		tls_client.WithClientProfile(profiles.Chrome_152),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(newCookieJar()),
 		tls_client.WithDialer(dialer),
+		tls_client.WithTransportOptions(&tls_client.TransportOptions{
+			ReadIdleTimeout: &readIdle,
+			PingTimeout:     &pingTimeout,
+		}),
 	}
 	if strings.TrimSpace(proxyURL) != "" {
 		options = append(options, tls_client.WithProxyUrl(strings.TrimSpace(proxyURL)))

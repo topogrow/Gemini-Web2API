@@ -416,7 +416,12 @@ func (c *Client) stream(ctx context.Context, request GenerateRequest, emit func(
 	}
 	guard := newModelGuard(model, newFailureTextGuard(withDownload).Emit)
 	decoder := NewFrameDecoder()
-	decoder.heartbeat = trace.UpstreamHeartbeat
+	// 心跳是上游仍在工作的直接证据：长时间渲染类任务（如视频生成）在成品
+	// 返回前可能数分钟只发心跳，若把心跳排除在进展之外，会被流空闲看门狗误杀。
+	decoder.heartbeat = func() {
+		trace.UpstreamHeartbeat()
+		progress(streamCtx)
+	}
 	decoder.awaitIncomplete = request.researchPlan != nil
 	err = decoder.Decode(tracedReader{reader: resp.Body, trace: trace}, decodeState, func(event Event) error {
 		progress(streamCtx)
