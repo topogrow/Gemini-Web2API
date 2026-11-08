@@ -1,7 +1,9 @@
 package gemini
 
 import (
+	"net"
 	"strings"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/fhttp/cookiejar"
@@ -41,11 +43,16 @@ var chromeGoogleHeaders = map[string]string{
 
 // NewHTTPClient 创建 TLS 与 HTTP/2 握手和 Chrome 稳定版一致的客户端
 func NewHTTPClient(timeoutSeconds int, proxyURL string) (tls_client.HttpClient, error) {
+	dialer := net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(timeoutSeconds),
 		tls_client.WithClientProfile(profiles.Chrome_152),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(newCookieJar()),
+		tls_client.WithDialer(dialer),
 	}
 	if strings.TrimSpace(proxyURL) != "" {
 		options = append(options, tls_client.WithProxyUrl(strings.TrimSpace(proxyURL)))
