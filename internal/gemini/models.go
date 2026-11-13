@@ -302,8 +302,8 @@ var legacyModelAliases = map[string][]string{
 	"gemini-quick-answers": {"gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite"},
 	// mode=1 Everyday help：官网默认档位
 	"gemini-everyday-help": {"gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash", "gemini"},
-	// mode=8 Most complex work：最重度档位
-	"gemini-most-complex-work": {"gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro", "gemini-pro"},
+	// mode=8 Most complex work：最重度档位（含 Gemini 4 Argon 旗舰的继任）
+	"gemini-most-complex-work": {"gemini-4-argon", "gemini-4", "gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro", "gemini-pro"},
 }
 
 // registerLegacyAliases 把旧模型 ID 作为别名挂到目录 lookup 上

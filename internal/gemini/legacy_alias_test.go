@@ -25,6 +25,8 @@ func TestLegacyAliasesResolve(t *testing.T) {
 		"gemini-3.5-flash":      "gemini-everyday-help",
 		"gemini":                "gemini-everyday-help",
 		"gemini-3.1-pro":        "gemini-most-complex-work",
+		"gemini-4-argon":        "gemini-most-complex-work",
+		"gemini-4":              "gemini-most-complex-work",
 		"gemini-2.5-pro":        "gemini-most-complex-work",
 		"gemini-pro":            "gemini-most-complex-work",
 		// 当前官方名不受影响
