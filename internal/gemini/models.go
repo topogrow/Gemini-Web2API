@@ -288,7 +288,37 @@ func parseModelCatalog(payload []any) (ModelCatalog, error) {
 		entry.ID, entry.DisplayName, entry.Default, entry.Feature, entry.ThinkingLevels = entry.ID+"-task", entry.DisplayName+" Task", false, FeatureTask, levels
 		catalog.add(entry)
 	}
+	catalog.registerLegacyAliases()
 	return catalog, nil
+}
+
+// legacyModelAliases 是官网旧版数字命名模型到当前模式命名的兼容映射。
+// 2026-11 起官网模型菜单把「Gemini 3.x Flash / Pro」整批替换为
+// Quick answers、Everyday help、Most complex work、Detailed research 四个模式，
+// 旧公开 ID 会随之下线；这里让既有客户端继续用旧 ID 调用。
+// 仅当目录中不存在同名条目时才注册，避免官网改回数字命名时错误覆盖。
+var legacyModelAliases = map[string][]string{
+	// mode=6 Quick answers：最轻量快速的档位
+	"gemini-quick-answers": {"gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite"},
+	// mode=1 Everyday help：官网默认档位
+	"gemini-everyday-help": {"gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash", "gemini"},
+	// mode=8 Most complex work：最重度档位
+	"gemini-most-complex-work": {"gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro", "gemini-pro"},
+}
+
+// registerLegacyAliases 把旧模型 ID 作为别名挂到目录 lookup 上
+func (c *ModelCatalog) registerLegacyAliases() {
+	for current, aliases := range legacyModelAliases {
+		if _, ok := c.lookup[current]; !ok {
+			continue
+		}
+		for _, alias := range aliases {
+			key := strings.ToLower(alias)
+			if _, exists := c.lookup[key]; !exists {
+				c.lookup[key] = c.lookup[current]
+			}
+		}
+	}
 }
 
 // removeTools 去掉目录末尾的官网工具与 Task 条目，用于官网工具菜单全部禁用的访客会话
