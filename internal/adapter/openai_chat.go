@@ -320,6 +320,8 @@ func buildOpenAIChatPrompt(c *gin.Context, client *gemini.Client, request ChatRe
 	if err != nil {
 		return "", nil, err
 	}
+	// 大会话按需裁剪工具：历史未使用的 MCP 工具降级为名称索引
+	bridge.Compact(transcript)
 	suffix, err := bridge.PromptSuffix()
 	if err != nil {
 		return "", nil, err

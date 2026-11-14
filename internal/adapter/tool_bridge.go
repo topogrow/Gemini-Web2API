@@ -38,6 +38,76 @@ type ToolBridge struct {
 	RequireImageGeneration bool
 	// AspectRatio 为生图请求的宽高比
 	AspectRatio string
+	// compactIndex 收纳按需裁剪时被降级的工具：PromptSuffix 只列出名称与用途，
+	// 不再内联完整参数 schema；Definitions 保持全量，Parse 仍可校验与还原参数结构
+	compactIndex []ToolDefinition
+}
+
+// promptCompactThreshold 是触发工具按需裁剪的完整 prompt 字节水位。
+// 官网 StreamGenerate 在数 MB 时直接静默终止（见 gemini.maxPromptBytes），
+// 约 2MB 起模型质量退化；超过该水位就把会话历史中未出现过的 MCP 工具
+// 降级为名称索引，避免为用不到的 schema 烧掉预算。
+const promptCompactThreshold = 1 << 20
+
+// Compact 按会话历史裁剪工具声明：历史中出现过的工具与内置工具保留完整
+// schema，其余 MCP 工具降级为轻量索引。transcript 为已渲染的会话文本，
+// 工具名在其中出现即视为“本轮可能延续使用”。
+func (b *ToolBridge) Compact(transcript string) {
+	if len(b.Definitions) == 0 || len(b.compactIndex) > 0 {
+		return
+	}
+	definitionsJSON, err := json.Marshal(b.Definitions)
+	if err != nil {
+		return
+	}
+	// 估算完整 prompt 规模（transcript + suffix 骨架），水位内不折腾
+	if len(transcript)+len(definitionsJSON)+4096 < promptCompactThreshold {
+		return
+	}
+	kept := make([]ToolDefinition, 0, len(b.Definitions))
+	index := make([]ToolDefinition, 0)
+	for _, definition := range b.Definitions {
+		if isBuiltinToolName(definition.Name) || strings.Contains(transcript, definition.Name) {
+			kept = append(kept, definition)
+			continue
+		}
+		index = append(index, ToolDefinition{
+			Name:        definition.Name,
+			Description: firstSentence(definition.Description),
+		})
+	}
+	// 全量都在历史里出现过时无需裁剪
+	if len(index) == 0 {
+		return
+	}
+	// Definitions 保持全量：Parse 仍可对被索引工具做参数结构校验；
+	// 完整 schema 的序列化范围由 compactSchemaVisible 决定
+	b.compactIndex = index
+}
+
+// isBuiltinToolName 判断是否为客户端内置工具（无 MCP server 前缀）。
+// 内置工具（Bash、Read、Edit 等）是 agent 的基本操作面，永远保留完整 schema。
+func isBuiltinToolName(name string) bool {
+	return !strings.Contains(name, "__")
+}
+
+// firstSentence 截取描述首句，作为索引中的一行用途说明
+func firstSentence(description string) string {
+	description = strings.TrimSpace(description)
+	if description == "" {
+		return ""
+	}
+	if cut, _, found := strings.Cut(description, "。"); found && cut != "" {
+		return cut + "。"
+	}
+	if cut, _, found := strings.Cut(description, ". "); found && cut != "" {
+		return cut + "."
+	}
+	runes := []rune(description)
+	if len(runes) > 120 {
+		return string(runes[:120]) + "…"
+	}
+	return description
 }
 
 // PromptSuffix 返回追加到用户提示词的协议约束
@@ -45,7 +115,11 @@ func (b ToolBridge) PromptSuffix() (string, error) {
 	var sections []string
 
 	if len(b.Definitions) > 0 && !strings.EqualFold(strings.TrimSpace(b.Choice), "none") {
-		definitions, err := json.Marshal(b.Definitions)
+		visible := b.Definitions
+		if len(b.compactIndex) > 0 {
+			visible = b.compactSchemaVisible()
+		}
+		definitions, err := json.Marshal(visible)
 		if err != nil {
 			return "", fmt.Errorf("编码工具定义失败: %w", err)
 		}
@@ -67,6 +141,19 @@ func (b ToolBridge) PromptSuffix() (string, error) {
 可用工具：%s
 工具选择：%s
 %s，格式必须为 {"tool_calls":[{"name":"工具名称","arguments":{}}]}，不要输出 Markdown 代码块或额外文字`, definitions, choice, rule))
+
+		if len(b.compactIndex) > 0 {
+			names := make([]string, 0, len(b.compactIndex))
+			for _, definition := range b.compactIndex {
+				entry := definition.Name
+				if definition.Description != "" {
+					entry += "（" + definition.Description + "）"
+				}
+				names = append(names, entry)
+			}
+			sections = append(sections, fmt.Sprintf(`另有 %d 个工具本次未列出参数结构，仅在确有需要时调用，参数按工具语义构造：%s`,
+				len(b.compactIndex), strings.Join(names, "；")))
+		}
 	}
 
 	if len(b.JSONSchema) > 0 {
@@ -181,6 +268,25 @@ func extractToolCallJSON(text string) string {
 
 func (b ToolBridge) hasTool(name string) bool {
 	return b.tool(name).Name != ""
+}
+
+// compactSchemaVisible 返回进入完整 schema 序列化的工具集合；
+// 按需裁剪生效时只保留保留集，未裁剪时即全量
+func (b ToolBridge) compactSchemaVisible() []ToolDefinition {
+	if len(b.compactIndex) == 0 {
+		return b.Definitions
+	}
+	hidden := make(map[string]struct{}, len(b.compactIndex))
+	for _, definition := range b.compactIndex {
+		hidden[definition.Name] = struct{}{}
+	}
+	visible := make([]ToolDefinition, 0, len(b.Definitions)-len(hidden))
+	for _, definition := range b.Definitions {
+		if _, ok := hidden[definition.Name]; !ok {
+			visible = append(visible, definition)
+		}
+	}
+	return visible
 }
 
 func (b ToolBridge) tool(name string) ToolDefinition {
