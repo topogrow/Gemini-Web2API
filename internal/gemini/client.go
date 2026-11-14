@@ -328,6 +328,17 @@ func (c *Client) stream(ctx context.Context, request GenerateRequest, emit func(
 	if err != nil {
 		return err
 	}
+	// 官网 StreamGenerate 对 prompt 有硬性大小上限（实测 2MB 附近质量退化、
+	// 数 MB 必拒），超限时上游接受请求却直接回终止帧、不给任何候选，表现为
+	// 模糊的 "protocol ended without a completed candidate"。这里前置拦截，
+	// 给客户端一个可行动的 413，而不是让账号白白冷却两分钟。
+	if promptBytes := len(request.Prompt); promptBytes > maxPromptBytes {
+		return &ProtocolError{
+			HTTPStatus: 413, Code: 413, Retryable: false,
+			Message: fmt.Sprintf("提示词 %s 超过官网协议上限 %s（含会话历史与工具定义），请精简上下文、减少消息条数或削减 MCP 工具后重试",
+				formatBytes(promptBytes), formatBytes(maxPromptBytes)),
+		}
+	}
 	previousMode := request.Conversation.Snapshot().ModelMode
 	if previousMode == 0 {
 		previousMode = selectedModelMode(bootstrap.Catalog, bootstrap.Preferences)

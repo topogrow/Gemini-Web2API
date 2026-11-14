@@ -14,7 +14,15 @@ const requestCeilingSeconds = 3600
 // rpcTimeout 是单个 batchexecute RPC 的时限
 const rpcTimeout = 600 * time.Second
 
-// streamIdleTimeout 是生成流距上一个语义事件的最长等待，心跳不算进展
+// maxPromptBytes 是官网 StreamGenerate 能稳定接受的提示词字节上限。
+// 实测约 2MB 起模型质量退化（复读拒答），数 MB 时上游直接回终止帧且不给候选；
+// 取 2MB 作为前置拦截水位，超限返回 413 而不是把账号拖进无意义的冷却。
+const maxPromptBytes = 2 << 20
+
+// streamIdleTimeout 是生成流距上一个语义事件的最长等待；上游心跳同样算作进展，
+// 因此它实际衡量的是「连接彻底静默」的时长，而不是「多久没出正文」。
+// 重度档位（Most complex work / 原 3.1 Pro、4 Argon）的思考阶段可能长达数分钟，
+// 期间只有心跳，不能被这里误杀。
 var streamIdleTimeout = 600 * time.Second
 
 // errStreamIdle 表示生成流长时间没有语义事件
