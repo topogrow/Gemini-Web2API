@@ -127,3 +127,39 @@ func TestParseStillValidatesCompactedTools(t *testing.T) {
 		t.Fatal("未声明工具应被拒绝")
 	}
 }
+
+// TestExtractToolCallJSONToleratesTrailingGarbage 模型输出 JSON 后偶发尾随
+// 异常字符（如 U+1024），不应让整个工具调用漏成纯文本
+func TestExtractToolCallJSONToleratesTrailingGarbage(t *testing.T) {
+	valid := `{"tool_calls":[{"name":"Read","arguments":{"file_path":"/tmp/x.sh","limit":55,"offset":565}}]}`
+	cases := map[string]string{
+		"纯 JSON":          valid,
+		"尾随异常Unicode":     valid + "ဦ",
+		"尾随多个异常字符":        valid + "ဦ햐",
+		"尾随反引号":           valid + "```",
+		"尾随反引号加垃圾":        valid + "```ဦ",
+		"前后文字环绕":          "好的，我来读取文件。\n" + valid + "ဦ",
+		"尾随省略号":           valid + "…",
+	}
+	for label, text := range cases {
+		got := extractToolCallJSON(text)
+		if got == "" {
+			t.Errorf("%s: 应能提取工具调用", label)
+			continue
+		}
+		var envelope struct {
+			ToolCalls []struct{ Name string `json:"name"` } `json:"tool_calls"`
+		}
+		if err := json.Unmarshal([]byte(got), &envelope); err != nil {
+			t.Errorf("%s: 提取结果不是合法 JSON: %v", label, err)
+			continue
+		}
+		if len(envelope.ToolCalls) != 1 || envelope.ToolCalls[0].Name != "Read" {
+			t.Errorf("%s: 提取内容不符: %s", label, got)
+		}
+	}
+	// 无 tool_calls 的 JSON 不应误提取
+	if got := extractToolCallJSON(`{"answer":"不是工具调用"}`); got != "" {
+		t.Errorf("无 tool_calls 的 JSON 不应返回: %s", got)
+	}
+}

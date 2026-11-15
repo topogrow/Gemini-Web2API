@@ -247,19 +247,21 @@ func (b ToolBridge) Parse(text string) (string, []ToolCall, error) {
 }
 
 func extractToolCallJSON(text string) string {
-	if json.Valid([]byte(text)) {
-		return text
-	}
+	// 模型偶尔会在 JSON 结尾吐出非法尾随字符（如异常 Unicode token），
+	// json.Valid 会整体判死导致工具调用漏成纯文本；改用 json.Decoder
+	// 只取自该 { 起的第一个完整 JSON 值，天然忽略尾随垃圾。
 	for offset := 0; offset < len(text); {
 		relative := strings.IndexByte(text[offset:], '{')
 		if relative < 0 {
 			return ""
 		}
 		start := offset + relative
-		candidate := strings.TrimSpace(text[start:])
-		candidate = strings.TrimSpace(strings.TrimSuffix(candidate, "```"))
-		if json.Valid([]byte(candidate)) && strings.Contains(candidate, `"tool_calls"`) {
-			return candidate
+		var value json.RawMessage
+		if err := json.NewDecoder(strings.NewReader(text[start:])).Decode(&value); err == nil {
+			candidate := strings.TrimSpace(string(value))
+			if strings.Contains(candidate, `"tool_calls"`) {
+				return candidate
+			}
 		}
 		offset = start + 1
 	}
