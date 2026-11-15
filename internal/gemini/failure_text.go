@@ -15,10 +15,17 @@ var upstreamFailureTexts = []string{
 	"Sorry, something went wrong. Please try your request again.",
 	"I encountered an error doing what you asked. Could you try again?",
 	"I seem to be encountering an error. Can I try something else for you?",
-	"I'm having a hard time fulfilling your request. Can I help you with something else instead?",
-	"Normally I can help with things like this, but I don't seem to have access to that content. You can try again or ask me for something else.",
 	"请恕我爱莫能助，我只是一个语言模型，不能理解或回复你的这个问题。",
 	"身为一个语言模型，我没办法提供这方面的帮助。",
+}
+
+// upstreamRefusalTexts 为 Gemini Web 内容策略拒绝的固定话术。与临时故障不同，
+// 换账号重试必然得到同样的拒绝——是请求内容触发了安全过滤，而不是账号或链路问题；
+// 重试还会把无辜账号拉进冷却。命中时按不可重试处理并给出可行动的提示。
+var upstreamRefusalTexts = []string{
+	"I'm having a hard time fulfilling your request. Can I help you with something else instead?",
+	"Normally I can help with things like this, but I don't seem to have access to that content. You can try again or ask me for something else.",
+	"I can't help with that.",
 }
 
 // errorCardPrefix 是官网临时故障时主候选正文中错误卡片链接的前缀，页面显示重试按钮
@@ -95,6 +102,11 @@ func isFailureTextPrefix(text string) bool {
 			return true
 		}
 	}
+	for _, refusal := range upstreamRefusalTexts {
+		if strings.HasPrefix(refusal, trimmed) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -108,13 +120,40 @@ func isFailureText(text string) bool {
 			return true
 		}
 	}
+	for _, refusal := range upstreamRefusalTexts {
+		if trimmed == refusal {
+			return true
+		}
+	}
+	return false
+}
+
+// isRefusalText 判断失败文字是否为内容策略拒绝
+func isRefusalText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	for _, refusal := range upstreamRefusalTexts {
+		if trimmed == refusal {
+			return true
+		}
+	}
 	return false
 }
 
 func failureTextError(text string) *ProtocolError {
-	message := fmt.Sprintf("Gemini Web 返回固定失败文字：%s", strings.TrimSpace(text))
-	if errorCardPattern.MatchString(strings.TrimSpace(text)) {
+	trimmed := strings.TrimSpace(text)
+	message := fmt.Sprintf("Gemini Web 返回固定失败文字：%s", trimmed)
+	if errorCardPattern.MatchString(trimmed) {
 		message = "Gemini Web 返回错误卡片，官网对应“出错了，请重试”"
+	}
+	if isRefusalText(text) {
+		// 内容策略拒绝：换账号必然同样被拒，不重试、不冷却账号
+		return &ProtocolError{
+			HTTPStatus: 422,
+			Code:       422,
+			Message:    message + "。该回复来自 Google 内容策略拒绝（换账号无效），请调整提问措辞、拆分敏感内容，或改用其他模型/服务处理该话题",
+			Retryable:  false,
+			Cause:      ErrUpstreamFailureText,
+		}
 	}
 	return &ProtocolError{
 		HTTPStatus: 502,
