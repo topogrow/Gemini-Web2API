@@ -292,31 +292,59 @@ func parseModelCatalog(payload []any) (ModelCatalog, error) {
 	return catalog, nil
 }
 
-// legacyModelAliases 是官网旧版数字命名模型到当前模式命名的兼容映射。
-// 2026-11 起官网模型菜单把「Gemini 3.x Flash / Pro」整批替换为
-// Quick answers、Everyday help、Most complex work、Detailed research 四个模式，
-// 旧公开 ID 会随之下线；这里让既有客户端继续用旧 ID 调用。
-// 仅当目录中不存在同名条目时才注册，避免官网改回数字命名时错误覆盖。
-var legacyModelAliases = map[string][]string{
-	// mode=6 Quick answers：最轻量快速的档位
-	"gemini-quick-answers": {"gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite"},
-	// mode=1 Everyday help：官网默认档位
-	"gemini-everyday-help": {"gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-flash", "gemini"},
-	// mode=8 Most complex work：最重度档位（含 Gemini 4 Argon 旗舰的继任）
-	"gemini-most-complex-work": {"gemini-4-argon", "gemini-4", "gemini-3.1-pro", "gemini-3-pro", "gemini-2.5-pro", "gemini-pro"},
+// legacyModelTargets 按意图档位给出候选目标链；注册别名时取目录中第一个存在的
+// 官方名。官网在 2026-11 内两次改换模式命名（most-complex-work → code-complex-work、
+// quick-answers/detailed-research → deeper-analysis/auto），按固定名映射会在每次
+// 改名后集体失效，因此按档位意图而不是具体名字对齐。
+var legacyModelTargets = map[string][]string{
+	// 轻量快速档
+	"lite": {"gemini-quick-answers", "gemini-everyday-help"},
+	// 官网默认档
+	"standard": {"gemini-everyday-help"},
+	// 重度/旗舰档（编码与复杂工作）
+	"complex": {"gemini-most-complex-work", "gemini-code-complex-work", "gemini-deeper-analysis", "gemini-everyday-help"},
+	// 深度分析/研究档；不含 gemini-deep-research 工具（那是长任务研究模式，不能当对话档位）
+	"research": {"gemini-detailed-research", "gemini-deeper-analysis", "gemini-everyday-help"},
 }
 
-// registerLegacyAliases 把旧模型 ID 作为别名挂到目录 lookup 上
+// legacyModelAliases 把旧模型 ID 映射到意图档位。覆盖三代命名：
+// 数字命名家族（Gemini 3.x/4）、2026-11 上旬的模式命名、及泛称。
+var legacyModelAliases = map[string]string{
+	"gemini":                   "standard",
+	"gemini-flash":             "standard",
+	"gemini-3.8-flash":         "standard",
+	"gemini-3.6-flash":         "standard",
+	"gemini-3.5-flash":         "standard",
+	"gemini-2.5-flash":         "standard",
+	"gemini-3.5-flash-lite":    "lite",
+	"gemini-2.5-flash-lite":    "lite",
+	"gemini-flash-lite":        "lite",
+	"gemini-4-argon":           "complex",
+	"gemini-4":                 "complex",
+	"gemini-3.1-pro":           "complex",
+	"gemini-3-pro":             "complex",
+	"gemini-2.5-pro":           "complex",
+	"gemini-pro":               "complex",
+	"gemini-quick-answers":     "lite",
+	"gemini-most-complex-work": "complex",
+	"gemini-detailed-research": "research",
+}
+
+// registerLegacyAliases 把旧模型 ID 作为别名挂到目录 lookup 上；
+// 目标取该意图档位候选链中第一个存在的官方名，且不覆盖目录已有的同名条目
 func (c *ModelCatalog) registerLegacyAliases() {
-	for current, aliases := range legacyModelAliases {
-		if _, ok := c.lookup[current]; !ok {
+	for alias, intent := range legacyModelAliases {
+		key := strings.ToLower(alias)
+		if _, exists := c.lookup[key]; exists {
 			continue
 		}
-		for _, alias := range aliases {
-			key := strings.ToLower(alias)
-			if _, exists := c.lookup[key]; !exists {
-				c.lookup[key] = c.lookup[current]
+		for _, target := range legacyModelTargets[intent] {
+			index, ok := c.lookup[strings.ToLower(target)]
+			if !ok {
+				continue
 			}
+			c.lookup[key] = index
+			break
 		}
 	}
 }
